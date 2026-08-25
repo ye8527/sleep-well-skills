@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.sleepwell-codex</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec "$HOME/.codex/skills/sleep-well-codex/bin/orchestrator.sh"</string>
+  </array>
+  <!-- 每 5 分钟触发。抢不到锁的触发会在毫秒内退出且不调用任何 AI，故空转零成本。 -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/sleepwell-codex.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/sleepwell-codex.err</string>
+  <!-- -lc 走登录 shell，保证 PATH 里有 codex / claude / node -->
+</dict>
+</plist>

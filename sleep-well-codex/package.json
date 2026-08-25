@@ -1,0 +1,10 @@
+{
+  "name": "sleep-well-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test && npm run test:sh",
+    "test:sh": "bash test/prot-hash.test.sh && bash test/hook-state.test.sh && bash test/watchdog.test.sh && bash test/e2e.test.sh"
+  }
+}
