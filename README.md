@@ -33,3 +33,6 @@ These skills can modify files and create local Git commits while unattended. The
 
 The launchd files are templates for macOS. Inspect them before copying to `~/Library/LaunchAgents/`; the Claude watchdog is disabled by default.
 
+## Release hygiene
+
+Publish from a fresh repository containing only the required working-tree files. Do not carry over local Git history, runtime state, logs, backups, machine-specific configuration, or internal planning notes.
