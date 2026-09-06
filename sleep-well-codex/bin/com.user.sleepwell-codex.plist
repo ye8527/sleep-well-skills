@@ -8,17 +8,13 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>exec "$HOME/.codex/skills/sleep-well-codex/bin/orchestrator.sh"</string>
+    <string>umask 077; mkdir -p "$HOME/Library/Logs/sleep-well" || exit 1; chmod 700 "$HOME/Library/Logs/sleep-well" || exit 1; exec "$HOME/.codex/skills/sleep-well-codex/bin/orchestrator.sh" >>"$HOME/Library/Logs/sleep-well/codex.out" 2>>"$HOME/Library/Logs/sleep-well/codex.err"</string>
   </array>
-  <!-- 每 5 分钟触发。抢不到锁的触发会在毫秒内退出且不调用任何 AI，故空转零成本。 -->
+  <!-- launchd 会丢弃 job 运行期间的 interval 触发，因此不会启动并发实例；脚本内抢锁仅为手工调用与异常并发兜底。 -->
   <key>StartInterval</key>
   <integer>300</integer>
   <key>RunAtLoad</key>
   <false/>
-  <key>StandardOutPath</key>
-  <string>/tmp/sleepwell-codex.out</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/sleepwell-codex.err</string>
-  <!-- -lc 走登录 shell，保证 PATH 里有 codex / claude / node -->
+  <!-- 注意：-lc 不保证 PATH 含 codex / claude / node；orchestrator.sh 会在既有 PATH 后追加常见安装位置。 -->
 </dict>
 </plist>

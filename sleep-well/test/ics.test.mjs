@@ -10,7 +10,7 @@ const ICS = [
   "DESCRIPTION:bring the Q2 figures",
   "END:VEVENT",
   "BEGIN:VEVENT",
-  "SUMMARY:Lunch with Kenji",
+  "SUMMARY:Lunch with a friend",
   "DTSTART:20260617T120000Z",
   "END:VEVENT",
   "END:VCALENDAR",
@@ -22,7 +22,7 @@ test("parseIcs extracts VEVENTs with summary/start/notes", () => {
   assert.equal(ev[0].summary, "Prepare slides for lab meeting");
   assert.equal(ev[0].start, "20260617T100000");
   assert.equal(ev[0].notes, "bring the Q2 figures");
-  assert.equal(ev[1].summary, "Lunch with Kenji");
+  assert.equal(ev[1].summary, "Lunch with a friend");
 });
 
 test("deriveCalendarTasks keeps only artifact-implying events, all propose-only", () => {

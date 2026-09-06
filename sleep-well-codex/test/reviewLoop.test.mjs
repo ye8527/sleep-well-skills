@@ -1,7 +1,7 @@
 // test/reviewLoop.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideNext } from "../lib/reviewLoop.mjs";
+import { decideNext, parseFindingCount } from "../lib/reviewLoop.mjs";
 
 const cfg = { review_rounds_rotate_at: 10, review_rotations_max: 2, review_stall_rounds: 2 };
 
@@ -29,4 +29,18 @@ test("rotation cap reached -> stop", () => {
   const d = decideNext(hist, 2, cfg);
   assert.equal(d.action, "stop");
   assert.equal(d.reason, "rotation-cap");
+});
+
+test("missing config keys retain the default stall guard", () => {
+  const d = decideNext([3, 3], 0, {});
+  assert.equal(d.action, "stop");
+  assert.equal(d.reason, "stall");
+});
+
+test("parseFindingCount rejects empty, negative, fractional and unsafe values", () => {
+  assert.equal(parseFindingCount("0"), 0);
+  assert.equal(parseFindingCount("12"), 12);
+  for (const bad of ["", "-1", "1.5", "NaN", "9007199254740992"]) {
+    assert.throws(() => parseFindingCount(bad), /findings 条数/);
+  }
 });

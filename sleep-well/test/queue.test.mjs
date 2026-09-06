@@ -38,7 +38,7 @@ test("parseQueue returns tasks in priority order with defaults applied", () => {
 });
 
 test("parseQueue sorts by priority ascending", () => {
-  const tasks = parseQueue("## B\n- id: b\n- priority: 5\n\nx\n## A\n- id: a\n- priority: 1\n\ny\n");
+  const tasks = parseQueue("## B\n- id: b\n- repo: /tmp/example\n- priority: 5\n\nx\n## A\n- id: a\n- repo: /tmp/example\n- priority: 1\n\ny\n");
   assert.deepEqual(tasks.map((t) => t.id), ["a", "b"]);
 });
 
@@ -47,7 +47,7 @@ test("parseQueue throws on a block missing an id", () => {
 });
 
 test("parseQueue passes through optional files/team fields", () => {
-  const tasks = parseQueue("## Big\n- id: x\n- type: feature\n- files: 7\n- team: true\n\nbody\n");
+  const tasks = parseQueue("## Big\n- id: x\n- repo: /tmp/example\n- type: feature\n- files: 7\n- team: true\n\nbody\n");
   assert.equal(tasks[0].files, 7);
   assert.equal(tasks[0].team, true);
 });
@@ -58,12 +58,56 @@ test("parseQueue expands ~ in repo to an absolute path", () => {
 });
 
 test("untyped queue tasks default to inline-routed 'task'", () => {
-  const tasks = parseQueue("## X\n- id: x\n- priority: 1\n\nbody\n");
+  const tasks = parseQueue("## X\n- id: x\n- repo: /tmp/example\n- priority: 1\n\nbody\n");
   assert.equal(tasks[0].type, "task");
 });
 
 test("parseQueue keeps non-meta bullets (e.g. - Expected:) in the prompt", () => {
-  const tasks = parseQueue("## T\n- id: x\n- type: bugfix\n\nReproduce then fix.\n- Expected: returns 200\n");
+  const tasks = parseQueue("## T\n- id: x\n- repo: /tmp/example\n- type: bugfix\n\nReproduce then fix.\n- Expected: returns 200\n");
   assert.match(tasks[0].prompt, /Expected: returns 200/);
   assert.equal(tasks[0].type, "bugfix");
+});
+
+// R15 自查: 这个模块解析的是**用户手写的 Markdown**，而它十五轮没被单独审过。
+// 三条都是我自己查出来的，Codex 本轮聚焦在 diff 上没覆盖到。
+test("queue: id 只允许安全字符（它会被拼进文件路径）", () => {
+  // 编排器用 `$LOG_DIR/${id}-*.out` 与 `$LOG_DIR/${id}.md`，`../` 会写到 logs 之外。
+  // 队列是用户手写的，所以这不是攻击面，而是打错字就写到意想不到的地方——失败必须响亮。
+  // R16 #2: R15 我限定 id 只能是 A-Za-z0-9._- ——**那是过度纠正**，
+  // queue.md 与 Claude 侧共享且用户手写，中文/含空格 id 完全合法，
+  // 整队拒绝解析会让一次升级静默停掉安装。只拦真正危险的那两类。
+  assert.throws(() => parseQueue("## A\n- id: ../../evil\n- repo: /tmp/example\n> x\n"), /路径分隔符/);
+  assert.throws(() => parseQueue("## A\n- id: a/b\n- repo: /tmp/example\n> x\n"), /路径分隔符/);
+  assert.doesNotThrow(() => parseQueue("## A\n- id: 修复空指针\n- repo: /tmp/example\n> x\n"));
+  assert.doesNotThrow(() => parseQueue("## A\n- id: task 1\n- repo: /tmp/example\n> x\n"));
+});
+
+test("queue: priority/files 非整数时报错，而不是静默变 NaN", () => {
+  // NaN 参与比较全为 false → sort 结果不可预测且无任何提示
+  assert.throws(() => parseQueue("## A\n- id: a\n- repo: /tmp/example\n- priority: l\n> x\n"), /priority/);
+  assert.throws(() => parseQueue("## A\n- id: a\n- repo: /tmp/example\n- files: 三\n> x\n"), /files/);
+  const t = parseQueue("## A\n- id: a\n- repo: /tmp/example\n- priority: 5\n> x\n");
+  assert.equal(t[0].priority, 5);
+});
+
+test("queue: 重复 id 检查只做一次（曾有一段被误粘贴进循环内部）", () => {
+  assert.throws(() => parseQueue("## A\n- id: a\n- repo: /tmp/example\n> x\n\n## B\n- id: a\n- repo: /tmp/example\n> y\n"), /重复/);
+  // 多个不同 id 正常
+  assert.equal(parseQueue("## A\n- id: a\n- repo: /tmp/example\n> x\n\n## B\n- id: b\n- repo: /tmp/example\n> y\n").length, 2);
+});
+
+test("queue: repo is required and parseQueue rejects a path in place of Markdown", () => {
+  assert.throws(() => parseQueue("## A\n- id: a\n> x\n"), /缺少 repo/);
+  assert.throws(() => parseQueue("~/sleep-well/queue.md"), /file contents/);
+});
+
+test("queue: title rejects C0/C1 controls before they can rewrite logs or reports", () => {
+  assert.throws(
+    () => parseQueue("## bad\u009b2Ktitle\n- id: a\n- repo: /tmp/example\n> x\n"),
+    /标题含控制字符/,
+  );
+  assert.throws(
+    () => parseQueue("## bad\u0001title\n- id: a\n- repo: /tmp/example\n> x\n"),
+    /标题含控制字符/,
+  );
 });

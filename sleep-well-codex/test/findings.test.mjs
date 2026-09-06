@@ -13,3 +13,13 @@ test("findingKey is stable for the same file+line+text", () => {
   assert.notEqual(a, findingKey({ repo: "r", file: "a.js", line: 11, issue: "x" }));
 });
 
+test("appendFinding preserves runId and writes its stable key", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sw-codex-find-"));
+  const path = join(dir, "findings.jsonl");
+  const rec = appendFinding(path, {
+    repo: "r", file: "a.js", line: 1, issue: "bug", severity: "auto", taskId: "t1", runId: 123,
+  });
+  assert.equal(rec.runId, 123);
+  assert.equal(rec.key, findingKey(rec));
+  rmSync(dir, { recursive: true, force: true });
+});

@@ -8,7 +8,10 @@
 // 一个真正的配置错误在夜里空转到天亮。
 
 const QUOTA_RE = /rate[ _-]?limit|usage[ _-]?limit|quota|429|too many requests|exceeded|额度|上限/i;
-const AUTH_RE = /not logged in|please run \/login|login required|unauthorized|401|oauth|authenticate|credential/i;
+// Authentication is the only classification that immediately halts the whole
+// night. Use strong CLI failure phrases, never ordinary task vocabulary such
+// as bare "oauth", "credential", "authenticate", "401", or "unauthorized".
+const AUTH_RE = /not logged in|please run \/login|(?:login|authentication) required|invalid (?:authentication )?credentials?|401\s+unauthorized|unauthorized\s*\(401\)/i;
 // 瞬时拥塞: 值得退避重试，与额度耗尽不同（后者要等窗口重置，重试无用）
 const TRANSIENT_RE = /overload|529|50[234]|timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|socket hang up|混雑/i;
 
@@ -16,11 +19,17 @@ const TRANSIENT_RE = /overload|529|50[234]|timeout|timed out|ECONN|ENOTFOUND|EAI
 // 返回 { side, kind }，kind ∈ quota | auth | transient | other | ok
 export function classifyOutcome(output, code, side) {
   const s = String(output || "");
+  // 124 is generated locally by run_with_timeout. The captured file may be a
+  // truncated agent transcript containing auth-related task vocabulary; it is
+  // not evidence that either remote account lost authentication.
+  if (code === 124) return { side, kind: "transient" };
   // ⚠️ 宽泛文本正则**只在失败输出上**使用: 一个成功的任务如果本身就在实现额度处理、
   // 或在描述 HTTP 429，正文里必然出现 quota/429/exceeded 等词，按文本判会被误判成
   // 不可用而错误退避、甚至按认证失效 halt（Codex R1 #17）。退出码 0 一律视为成功，
   // 唯一例外是 claude-handoff 自报的结构化信号 CLAUDE_UNAVAILABLE。
-  const selfReported = s.match(/CLAUDE_UNAVAILABLE\s*\(([a-z]+)\)/);
+  const selfReported = side === "claude"
+    ? s.match(/CLAUDE_UNAVAILABLE\s*\(([a-z]+)\)/)
+    : null;
   if (code === 0 && !selfReported) return { side, kind: "ok" };
 
   // claude-handoff 自己会打 CLAUDE_UNAVAILABLE (kind)，优先采信它的结构化判定

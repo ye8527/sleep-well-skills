@@ -2,6 +2,7 @@
   "name": "sleep-well-codex",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "node --test && npm run test:sh",

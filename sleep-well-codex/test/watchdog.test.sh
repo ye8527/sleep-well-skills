@@ -30,7 +30,7 @@ awk '/^# >>>TESTABLE:watchdog>>>/{f=1;next} /^# <<<TESTABLE:watchdog<<</{f=0} f'
 [ -s "$BLOCK" ] || { echo "抽取失败: 找不到 TESTABLE:watchdog 标记对"; exit 1; }
 # 自检项要绑**契约符号**，别绑某一版修复的实现细节（否则拿旧代码验证检出能力时
 # 会卡在抽取自检上，反而测不成——我第一版写的是 'PPID' 和 '_kill_tree_sweep()'，正是这个毛病）。
-for need in '_kill_tree()' 'start_watchdog()' 'stop_watchdog()' 'wd_self' 'HANG_LIMIT_SECS'; do
+for need in '_kill_descendants()' 'start_watchdog()' 'stop_watchdog()' 'wd_self' 'HANG_LIMIT_SECS'; do
   grep -qF -- "$need" "$BLOCK" || { echo "抽取自检失败: 区块里没有 [$need]"; exit 1; }
 done
 
@@ -56,7 +56,13 @@ mkparent() {   # $1=场景目录 $2=心跳有多旧（秒） $3=父进程要不�
       # 对抗测试（Codex R11 #5）: 持续派生子进程，检验快照竞态下有没有漏网的
       # 给派生的进程打上可辨识的标记: 父进程一死，后代就被 reparent 到 init，
       # `pgrep -P $parent` 必然为空——用它断言「无残留」是**假绿**（Codex R12 #6）。
-      echo '( while :; do ( exec -a swtest-orphan-'"$TAG"' sleep 300 ) & sleep 0.3; done ) &'
+      # macOS pgrep -f does not reliably expose argv[0] set by `exec -a`.
+      # Put the marker in the executable path so both ps and pgrep can observe
+      # the same real process without depending on unrelated system sleeps.
+      ln -s /bin/sleep "$d/swtest-orphan-$TAG"
+      : > "$d/child-pids"
+      printf '( while :; do ( %q 300 ) & echo $! >> %q; sleep 0.3; done ) &\n' \
+        "$d/swtest-orphan-$TAG" "$d/child-pids"
     fi
     if [ "$age" = 0 ]; then
       # 「健康的编排器」必须**持续刷新心跳**——真实编排器在主循环与 run_with_timeout
@@ -87,6 +93,24 @@ run_scene() {   # $1=场景名 $2=心跳年龄 $3=forky $4=标记 → 回显 "�
   while [ ! -s "$d/pid" ] && [ $n -lt 50 ]; do sleep 0.2; n=$((n+1)); done
   local pid; pid="$(cat "$d/pid" 2>/dev/null)"
   printf '%s %s\n' "$pid" "$wrapper"
+}
+
+count_alive_pid_file() {
+  local pid_file="$1" q n=0
+  while IFS= read -r q; do
+    [ -n "$q" ] && kill -0 "$q" 2>/dev/null && n=$((n + 1))
+  done < "$pid_file"
+  printf '%s\n' "$n"
+}
+
+count_stopped_pid_file() {
+  local pid_file="$1" q stat n=0
+  while IFS= read -r q; do
+    [ -n "$q" ] || continue
+    stat="$(ps -o stat= -p "$q" 2>/dev/null | tr -d ' ')"
+    case "$stat" in *T*) n=$((n + 1)) ;; esac
+  done < "$pid_file"
+  printf '%s\n' "$n"
 }
 
 echo "看门狗"
@@ -125,10 +149,11 @@ if [ -z "$P3" ]; then bad "场景启动失败"; else
   kill -0 "$P3" 2>/dev/null && { bad "持续 fork 时父进程未被杀"; kill -9 "$P3" 2>/dev/null; } \
                             || ok "持续 fork 时父进程仍被终止"
   sleep 2
-  # 按标记查，不用 pgrep -P（父死后后代被 reparent，那个查询必然为空 = 假绿）
-  leftover="$(pgrep -f "swtest-orphan-forky-${RUNTAG}" 2>/dev/null | wc -l | tr -d ' ')"
+  # 按启动时记录的 PID 查，不用 pgrep -P（父死后后代被 reparent，那个查询必然为空 = 假绿），
+  # 也不依赖 macOS 进程全表访问权限。
+  leftover="$(count_alive_pid_file "$TMPD/forky/child-pids")"
   [ "$leftover" = "0" ] && ok "杀完无残留（按标记查，非 pgrep -P 的假绿）" \
-                        || { bad "杀完仍有 ${leftover} 个被 reparent 的孤儿"; pkill -9 -f "swtest-orphan-forky-${RUNTAG}" 2>/dev/null; }
+                        || { bad "杀完仍有 ${leftover} 个被 reparent 的孤儿"; while IFS= read -r q; do kill -9 "$q" 2>/dev/null; done < "$TMPD/forky/child-pids"; }
 fi
 kill -9 "$W3" 2>/dev/null
 
@@ -147,9 +172,22 @@ else ok "owner 不匹配的陈旧 active-pgid 被忽略"; fi
 kill -9 "$W4" 2>/dev/null
 
 # ── 5. 杀完不得留下**永久 stopped** 的进程（自查，已实测该危害）──
-# _kill_tree 用 SIGSTOP 冻住后代以防它们在被杀前再 fork。但若在 STOP 与 CONT 之间
+# _kill_descendants 用 SIGSTOP 冻住后代以防它们在被杀前再 fork。但若在 STOP 与 KILL 之间
 # 杀手自己死掉，目标会永久停在状态 T——不退出、不占 CPU、极难发现，比孤儿运行更糟。
 # 现在后代走 STOP→KILL（KILL 对 stopped 进程直接生效，无需 CONT），窗口根本不存在。
+# First prove the detector can see the exact marker and a real T state.
+STOP_PROBE_BIN="$TMPD/swtest-orphan-nostop-probe-${RUNTAG}"
+ln -s /bin/sleep "$STOP_PROBE_BIN"
+"$STOP_PROBE_BIN" 300 & STOP_PROBE=$!
+printf '%s\n' "$STOP_PROBE" > "$TMPD/stop-probe-pids"
+sleep 0.2
+kill -STOP "$STOP_PROBE" 2>/dev/null
+sleep 0.2
+[ "$(count_stopped_pid_file "$TMPD/stop-probe-pids")" -gt 0 ] \
+  && ok "stopped 检测器正对照能命中本轮标记进程" \
+  || bad "stopped 检测器正对照未命中（断言会假绿）"
+kill -KILL "$STOP_PROBE" 2>/dev/null; wait "$STOP_PROBE" 2>/dev/null || true
+
 read -r P5 W5 <<<"$(run_scene nostopped 600 yes "nostop-${RUNTAG}")"
 if [ -z "$P5" ]; then bad "场景启动失败"; else
   n=0; while kill -0 "$P5" 2>/dev/null && [ $n -lt 40 ]; do sleep 1; n=$((n+1)); done
@@ -163,8 +201,7 @@ if [ -z "$P5" ]; then bad "场景启动失败"; else
   esac
   kill -9 "$P5" 2>/dev/null
   sleep 2
-  stopped="$(ps -o pid=,stat= -ax 2>/dev/null | awk '$2 ~ /T/ {print $1}' | while read -r q; do
-      [ "$(ps -o command= -p "$q" 2>/dev/null | grep -c 'sleep 300')" -gt 0 ] && echo "$q"; done | wc -l | tr -d ' ')"
+  stopped="$(count_stopped_pid_file "$TMPD/nostopped/child-pids")"
   [ "${stopped:-0}" = "0" ] && ok "杀完没有残留的永久 stopped 进程" \
                             || bad "残留 ${stopped} 个永久 stopped 进程（状态 T，永不退出）"
 fi

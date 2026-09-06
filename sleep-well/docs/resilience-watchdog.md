@@ -23,7 +23,7 @@
 
 2. 如果 `~/sleep-well/STOP` 存在，或 `state/current-run.json` 不存在 → 退出（无动作）。
 
-3. 如果心跳文件（`state/heartbeat`）的修改时间超过 20 分钟 → 尝试无头恢复：
+3. 如果心跳文件（`state/heartbeat`）的修改时间超过 `max(2700, SLEEP_WELL_AI_TIMEOUT + 900)` 秒（默认 45 分钟）→ 尝试无头恢复：
    ```sh
    claude -p "Resume the sleep-well night shift: run the sleep-well skill, ..."
    ```
@@ -37,6 +37,8 @@ cp ~/.claude/skills/sleep-well/bin/com.user.sleepwell-watchdog.plist \
    ~/Library/LaunchAgents/
 launchctl load -w ~/Library/LaunchAgents/com.user.sleepwell-watchdog.plist
 ```
+
+模板通过 shell wrapper 以 `umask 077` 创建 `~/Library/Logs/sleep-well/`（目录权限 `0700`），并把 stdout/stderr 写入该用户私有目录；它不使用共享 `/tmp` 下的可预测日志路径。
 
 验证已加载：
 ```bash
@@ -61,6 +63,8 @@ rm ~/Library/LaunchAgents/com.user.sleepwell-watchdog.plist
 - 无头会话**没有可见 UI**，无法从手机 app 实时操控。
 - 如果桌面客户端已在运行 `/loop sleep-well`，看门狗会产生**第二个竞争会话**；脚本本身不会检测这种情况（你需要在武装前确认桌面会话已死亡）。
 - 如果 `claude` CLI 未安装或未为无头使用授权，**只有第 1 步（报告刷新）会工作**——但那本身就已经很有价值。
+
+脚本会保留现有 `PATH`，并在其后追加 `~/.local/bin`、`~/bin`、Homebrew 与 nvm 的常见安装位置。仍找不到 Node 时会在 `~/sleep-well/logs/watchdog.log` 留下明确诊断并失败退出；找不到 Claude 时会保留已刷新的报告并跳过无头恢复。watchdog 自身采用 `umask 077`，并把专用运行根和 `logs/` 修复为 `0700`；`SLEEP_WELL_HOME` 必须是绝对专用目录，不能是 `/`、账户 HOME 或日志符号链接。该变量只影响这个可选看门狗及 `bin/report.mjs`，`SLEEP_WELL_SKILL` 只影响看门狗查找技能的位置；Claude 编排工作流本身仍固定使用 `~/sleep-well` 与 `~/.claude/skills/sleep-well`，所以不要只迁移看门狗路径，两者应保留默认值并与工作流一致。`SLEEP_WELL_NODE` 与 `SLEEP_WELL_CLAUDE` 可分别指定看门狗使用的命令。看门狗与晨报使用 `SLEEP_WELL_AI_TIMEOUT` 计算陈旧阈值；非法值不影响本次晨报刷新，但会如实记录诊断、禁用无头恢复并失败退出。launchd 使用时需显式设置这些变量。Codex 变体对应的运行根变量名是 `SLEEP_WELL_ROOT`，不是 `SLEEP_WELL_HOME`。
 
 ### 每 5 分钟一次，不是真正的 ScheduleWakeup 循环
 

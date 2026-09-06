@@ -9,8 +9,43 @@ import { join } from "node:path";
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function fmtEpoch(epoch) {
-  if (epoch == null || isNaN(epoch)) return "—";
-  return new Date(epoch * 1000).toISOString();
+  if (epoch == null) return "—";
+  const value = Number(epoch);
+  if (!Number.isFinite(value)) return "—";
+  const date = new Date(value * 1000);
+  return Number.isNaN(date.getTime()) ? "—" : date.toISOString();
+}
+
+// Report inputs include model-generated findings and filesystem names. Replace
+// terminal control characters instead of failing the emergency report.
+function safeDisplay(value) {
+  return String(value ?? "").replace(/\p{Cc}/gu, "�");
+}
+function safeCode(value) {
+  return safeDisplay(value).replace(/`/g, "ˋ");
+}
+function safeTable(value) {
+  return safeDisplay(value).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+}
+
+function corruptStateNotice({ corruptPath, currentP, logsDir, commitPrefix, recoveryHint, archivePath }) {
+  const source = archivePath
+    ? `以下详情仅来自历史归档 \`${safeCode(archivePath)}\`，不代表本夜实际进展。`
+    : "归档里也没有可用记录。";
+  return [
+    "> 🚨 **状态文件损坏，本夜实际进展未知。**",
+    `> \`${safeCode(corruptPath || currentP)}\` 存在但无法解析；${source}`,
+    "> 夜班很可能是跑过的——任务可能已实现甚至已 checkpoint，**不要据此认为什么都没发生**。",
+    "",
+    "请自行核对：",
+    `- \`${safeCode(logsDir)}/\` 下的运行日志`,
+    `- 队列里各仓库的 \`git log\`（本工具的 checkpoint 提交信息以 \`${safeCode(commitPrefix)}\` 开头）`,
+    `- 损坏的状态文件本身（未删除，保留在 \`${safeCode(corruptPath || currentP)}\`）`,
+    "",
+    "恢复前先确认没有仍在运行的编排器，并核对各任务仓库的工作树与 checkpoint。然后把损坏文件移动到同目录下不匹配 `run-*.json` 的 `corrupt-current-run-<时间戳>.json.bak` 隔离名；保留证据，不要删除。",
+    "",
+    `恢复：${safeDisplay(recoveryHint)}`,
+  ];
 }
 
 /** Parse one JSONL file; skip blank/malformed lines silently. */
@@ -26,15 +61,12 @@ function readJsonl(path) {
 }
 
 /** Find the newest run-*.json archive in state/.
- *  返回 { state, corrupt }: corrupt=true 表示**找到了归档但读不了**——
- *  这与「没有归档」必须分开（Codex R11 提醒: R10 只修了 current-run.json 那一处）。
- *  原实现 `catch { return null }` 把两者折叠，于是最新归档损坏时早报仍会落到
- *  「夜班可能未启动」那个编造原因的分支。 */
+ *  Returns { state, corrupt, path }; an unreadable archive is distinct from no archive. */
 function newestArchive(stateDir) {
   if (!existsSync(stateDir)) return { state: null, corrupt: false };
   const files = readdirSync(stateDir)
     .filter((f) => /^run-.*\.json$/.test(f))
-    .sort();            // lexicographic; run-<date>.json sorts newest-last
+    .sort();            // run-YYYY-MM-DDTHHMMSS[~NNN].json sorts newest-last (and after legacy date-only names)
   if (!files.length) return { state: null, corrupt: false };
   const newest = join(stateDir, files[files.length - 1]);
   try {
@@ -50,50 +82,46 @@ function newestArchive(stateDir) {
  * @param {string} home      – root dir (e.g. ~/sleep-well or a tmp fixture)
  * @param {number} nowEpoch  – current time as Unix epoch seconds (injected; never call Date.now() here)
  */
-export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep-well", stopPath }) {
+export function heartbeatStaleSeconds(raw = process.env.SLEEP_WELL_AI_TIMEOUT) {
+  const text = raw == null || raw === "" ? "1800" : String(raw);
+  if (!/^\d+$/.test(text)) return 2700;
+  const seconds = Number(text);
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 86_400) return 2700;
+  return Math.max(2700, seconds + 900);
+}
+
+export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep-well", stopPath, commitPrefix = "sleep-well:", backupDir, staleSecs = heartbeatStaleSeconds() }) {
   const stateDir  = join(home, "state");
   const logsDir   = join(home, "logs");
   const currentP  = join(stateDir, "current-run.json");
   const heartbeatP = join(stateDir, "heartbeat");
   const stopP     = stopPath || join(home, "STOP");  // Codex 侧 home 是 root/codex，STOP 在 root
   const findingsP = join(home, "findings.jsonl");
-  const backupP   = join(home, "backups", "backup-manifest.jsonl");
+  const backupP   = join(backupDir || join(home, "backups"), "backup-manifest.jsonl");
 
   // ── 1. Load run state ─────────────────────────────────────────────────────
-  // ⚠️ 「文件损坏」与「从未启动」必须分开（R10 自查）。原来两者都落到下面那个
-  //    「找不到运行记录…夜班可能未启动」分支——而那句话是**编造的原因**:
-  //    夜班可能跑了一整夜、任务已实现并 checkpoint，只是 current-run.json 被写坏了。
-  //    早报是两侧 AI 全挂那一夜唯一的产物，而崩溃恰恰是它最可能被写坏的时候——
-  //    最需要它说实话的场景，就是它最容易说假话的场景。
+  // A corrupt state file means progress is unknown, not that the run never started.
   let runState = null;
   let stateCorrupt = false;
-  let corruptPath = null;      // 到底是哪个文件坏了——不能报一个不存在的路径（Codex R12 #8）
+  let corruptPath = null;
+  let stateSourcePath = null;
   if (existsSync(currentP)) {
-    try { runState = JSON.parse(readFileSync(currentP, "utf-8")); }
+    try { runState = JSON.parse(readFileSync(currentP, "utf-8")); stateSourcePath = currentP; }
     catch { stateCorrupt = true; corruptPath = currentP; }
   }
   if (!runState) {
     const arch = newestArchive(stateDir);
     runState = arch.state;
-    if (arch.corrupt) { stateCorrupt = true; corruptPath = corruptPath || arch.path; }   // 归档损坏同样是「读不了」
+    if (arch.state) stateSourcePath = arch.path;
+    if (arch.corrupt) { stateCorrupt = true; corruptPath = corruptPath || arch.path; }
   }
 
   if (!runState) {
     if (stateCorrupt) {
-      // 说事实，不猜原因: 文件在、但读不了，所以本夜实际进展**未知**。
       return [
         "# sleep-well 晨报",
         "",
-        "> 🚨 **状态文件损坏，本夜实际进展未知。**",
-        `> \`${corruptPath || currentP}\` 存在但无法解析，归档里也没有可用记录。`,
-        "> 夜班很可能是跑过的——任务可能已实现甚至已 checkpoint，**不要据此认为什么都没发生**。",
-        "",
-        "请自行核对：",
-        `- \`${logsDir}/\` 下的运行日志`,
-        "- 队列里各仓库的 `git log`（本工具的 checkpoint 提交信息以 `sleep-well-codex:` 开头）",
-        `- 损坏的状态文件本身（未删除，保留在 \`${corruptPath || currentP}\`）`,
-        "",
-        `恢复：${recoveryHint}`,
+        ...corruptStateNotice({ corruptPath, currentP, logsDir, commitPrefix, recoveryHint, archivePath: null }),
       ].join("\n");
     }
     return [
@@ -107,27 +135,42 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
   }
 
   const tasks    = Array.isArray(runState.tasks) ? runState.tasks : [];
-  const findings = readJsonl(findingsP);
-  const backups  = readJsonl(backupP);
+  // findings.jsonl intentionally retains history for Tier-1 discovery. Morning
+  // reports must show only this run and count each stable finding key once.
+  const findingsByKey = new Map();
+  for (const finding of readJsonl(findingsP)) {
+    if (finding.runId !== runState.startedAt) continue;
+    const key = `${finding.taskId ?? ""}\0${finding.key || JSON.stringify([
+      finding.repo, finding.file, finding.line, finding.issue, finding.severity, finding.taskId,
+    ])}`;
+    findingsByKey.set(key, finding);
+  }
+  const findings = [...findingsByKey.values()];
+  // backup-manifest.jsonl also retains history. Show only backups newly created
+  // for the run represented by this report.
+  const backups  = readJsonl(backupP).filter((b) => b.runId === runState.startedAt);
 
   // ── 2. Heartbeat / status banner ──────────────────────────────────────────
-  const STALE_SECS = 20 * 60;   // 20 minutes
+  const STALE_SECS = Number.isSafeInteger(staleSecs) && staleSecs > 0
+    ? staleSecs
+    : heartbeatStaleSeconds();
   const hasStop = existsSync(stopP);
 
   let heartbeatEpoch = null;
   if (existsSync(heartbeatP)) {
     try {
-      heartbeatEpoch = Math.floor(new Date(readFileSync(heartbeatP, "utf-8").trim()).getTime() / 1000);
+      const heartbeatMs = new Date(readFileSync(heartbeatP, "utf-8").trim()).getTime();
+      heartbeatEpoch = Number.isFinite(heartbeatMs) ? Math.floor(heartbeatMs / 1000) : null;
     } catch { /* bad timestamp — leave null */ }
   }
 
-  // 已收工的运行不应报「运行中」（Codex R2 #11）: finalize 会在出早报之前把
-  // terminatedAt/terminatedReason 写进 state，此处优先采信它，否则心跳刚刷新过、
-  // 早报会说「运行中」而实际编排器下一步就归档退出了。
+  // A finalized run takes precedence over a recently written heartbeat.
   let statusBanner;
   const term = runState && runState.terminatedAt ? runState : null;
-  if (term) {
-    statusBanner = `✅ **已收工** — ${term.terminatedReason || "原因未记录"}。`;
+  if (stateCorrupt) {
+    statusBanner = `🚨 **状态文件损坏** — 下方表格来自历史归档 \`${safeCode(stateSourcePath)}\`，不代表本夜进展。`;
+  } else if (term) {
+    statusBanner = `✅ **已收工** — ${safeDisplay(term.terminatedReason || "原因未记录")}。`;
   } else if (hasStop) {
     statusBanner = "✅ **正常停止** — STOP 文件已存在，夜班已结束。";
   } else if (heartbeatEpoch == null) {
@@ -148,6 +191,12 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
 
   lines.push("# sleep-well 晨报");
   lines.push("");
+  if (stateCorrupt) {
+    lines.push(...corruptStateNotice({
+      corruptPath, currentP, logsDir, commitPrefix, recoveryHint, archivePath: stateSourcePath,
+    }));
+    lines.push("");
+  }
   lines.push(`## 状态`);
   lines.push("");
   lines.push(statusBanner);
@@ -173,7 +222,7 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
       const autoCount = tFindings.filter((f) => f.severity === "auto").length;
       const nhCount   = tFindings.filter((f) => f.severity === "needs-human").length;
       const rotations = Array.isArray(t.findingsHistory) ? t.findingsHistory.length : (t.reviewRotations ?? 0);
-      lines.push(`| ${t.id} | ${t.title ?? ""} | ${t.status} | ${rotations} | ${autoCount} | ${nhCount} |`);
+      lines.push(`| ${safeTable(t.id)} | ${safeTable(t.title)} | ${safeTable(t.status)} | ${rotations} | ${autoCount} | ${nhCount} |`);
     }
   }
   lines.push("");
@@ -186,29 +235,29 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
     lines.push("_（无需人工处理的任务）_");
   } else {
     for (const t of nhTasks) {
-      lines.push(`### ${t.id} — ${t.title ?? "(无标题)"}`);
+      lines.push(`### ${safeDisplay(t.id)} — ${safeDisplay(t.title ?? "(无标题)")}`);
       const nhFindings = findings.filter((f) => f.taskId === t.id && f.severity === "needs-human");
       if (nhFindings.length === 0) {
         lines.push("_（无 needs-human findings）_");
       } else {
         for (const f of nhFindings) {
-          lines.push(`- \`${f.file}:${f.line}\` — ${f.issue}`);
+          lines.push(`- \`${safeCode(f.file)}:${safeCode(f.line)}\` — ${safeDisplay(f.issue)}`);
         }
       }
       lines.push("");
     }
   }
 
-  // ── 已备份的文件 ──────────────────────────────────────────────────────────
-  lines.push("## 已备份的文件");
+  // ── 本夜备份的文件 ────────────────────────────────────────────────────────
+  lines.push("## 本夜备份的文件");
   lines.push("");
   if (backups.length === 0) {
     lines.push("_（无备份记录）_");
   } else {
     for (const b of backups) {
-      lines.push(`- **${b.original}** → \`${b.backupPath}\``);
-      lines.push(`  - 运行日期: ${b.runDate ?? "—"}，原因: ${b.reason ?? "—"}`);
-      lines.push(`  - 确认无误后可删: \`rm "${b.backupPath}"\``);
+      lines.push(`- **${safeDisplay(b.original)}** → \`${safeCode(b.backupPath)}\``);
+      lines.push(`  - 运行日期: ${safeDisplay(b.runDate ?? "—")}，原因: ${safeDisplay(b.reason ?? "—")}`);
+      lines.push("  - 确认无误后，请逐字核对目标并用文件管理器或人工命令删除；本报告不生成可复制的删除命令。");
     }
   }
   lines.push("");
@@ -221,8 +270,8 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
   if (doneTasks.length === 0 && skippedTasks.length === 0) {
     lines.push("_（无完成或跳过任务）_");
   } else {
-    for (const t of doneTasks)    lines.push(`- ✅ **${t.id}** ${t.title ?? ""}`);
-    for (const t of skippedTasks) lines.push(`- ⏭️ **${t.id}** ${t.title ?? ""} _(skipped)_`);
+    for (const t of doneTasks)    lines.push(`- ✅ **${safeDisplay(t.id)}** ${safeDisplay(t.title)}`);
+    for (const t of skippedTasks) lines.push(`- ⏭️ **${safeDisplay(t.id)}** ${safeDisplay(t.title)} _(skipped)_`);
   }
   lines.push("");
 
@@ -235,12 +284,12 @@ export function buildReport({ home, nowEpoch, recoveryHint = "重开 /loop sleep
   if (logFiles.length === 0) {
     lines.push("_（无日志文件）_");
   } else {
-    for (const f of logFiles) lines.push(`- \`${join(logsDir, f)}\``);
+    for (const f of logFiles) lines.push(`- \`${safeCode(join(logsDir, f))}\``);
   }
   lines.push("");
 
   lines.push("---");
-  lines.push("恢复：重开 /loop sleep-well");
+  lines.push(`恢复：${safeDisplay(recoveryHint)}`);
 
   return lines.join("\n");
 }

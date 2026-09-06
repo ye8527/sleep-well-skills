@@ -17,8 +17,8 @@ export const DEFAULTS = {
   discovery_repo: "~/Projects/example-repo",
   discovery_tiers_auto: [1, 2, 3],
   discovery_tiers_propose: [4],
-  // ⚠️ 本技能不用这个默认值: Codex 侧的备份在 ~/sleep-well/codex/backups（状态独立的设计裁定），
-  // 由 orchestrator.sh 显式传给 cli.mjs backup-file。留在这里只为与 sleep-well 保持同源。
+  // Shared default for the Claude variant. The Codex orchestrator passes its
+  // independent ~/sleep-well/codex/backups path explicitly.
   backup_dir: "~/sleep-well/backups",
   backup_nongit_docs: true,
   backup_cleanup: "on-confirm",
@@ -30,13 +30,20 @@ export function expandHome(p) {
   return p;
 }
 
-export function mergeConfig(userCfg = {}) {
-  return { ...DEFAULTS, ...userCfg };
+export function parseMorningHour(value) {
+  const match = typeof value === "string" && /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+  if (!match) throw new TypeError("morning_hour 必须是 HH:MM（00:00–23:59）");
+  return { hour: Number(match[1]), minute: Number(match[2]) };
 }
 
-// ⚠️ 默认路径指向 **Claude 侧** 的 ~/sleep-well/config.json，而本技能的配置在
-// ~/sleep-well/codex/config.json。现有调用点都显式传路径（lib/cli.mjs），所以不是活缺陷，
-// 但不带参数调用会静默读到另一侧的配置——改这里之前先看清调用方（自查 T-5）。
+export function mergeConfig(userCfg = {}) {
+  const merged = { ...DEFAULTS, ...userCfg };
+  parseMorningHour(merged.morning_hour);
+  return merged;
+}
+
+// The no-argument default is the Claude-side config. Codex call sites must pass
+// ~/sleep-well/codex/config.json explicitly.
 export function loadConfig(path = join(homedir(), "sleep-well", "config.json")) {
   let userCfg = {};
   try {

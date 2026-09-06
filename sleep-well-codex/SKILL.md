@@ -1,69 +1,89 @@
 ---
 name: sleep-well-codex
-description: Overnight night-shift orchestrator for Codex. Works ~/sleep-well/queue.md task-by-task — implement, Claude Code review via claude-handoff, fix, re-review until zero findings (capped) — driven by a shell orchestrator under launchd, with disk-state resume, post-hoc guardrail verification, and ntfy.sh push. Triggers on sleep-well-codex, night shift, 夜班, overnight tasks, 通宵跑任务.
+description: Overnight night-shift orchestrator for Codex. Works ~/sleep-well/queue.md task-by-task — implement, Claude Code review via a compatible adapter, fix, re-review until zero findings (capped) — driven by a shell orchestrator under launchd, with disk-state relay, fail-closed quarantine of process-interrupted tasks, post-hoc guardrail verification, and optional ntfy.sh push. Triggers on sleep-well-codex, night shift, 夜班, overnight tasks, 通宵跑任务.
 ---
 
 # sleep-well-codex — Codex 夜班编排器
 
-## 这个技能是什么
+## 作用与边界
 
-用户睡觉时，Codex 按 `~/sleep-well/queue.md` 逐个完成任务，每个任务由 **Claude Code 独立审查**（经 `claude-handoff`），修复到零 findings 后 checkpoint，早上给一份早报。
+用户离开电脑时，`bin/orchestrator.sh` 按 `~/sleep-well/queue.md` 逐项调用 Codex 实现、调用独立的 Claude 审查适配器审查未提交差异，并在零 findings 后创建本地 checkpoint 提交。进度、心跳、日志和早报都写入 `~/sleep-well/codex/`；可用性失败会按磁盘状态中继。若整个编排器进程异常终止，遗留的 implementing/reviewing/fixing 任务会转 `needs_human` 而不自动续跑，避免把终止窗口内未核验的仓库改动吸收为新护栏基线。
 
-**反向对照物**：`~/.claude/skills/sleep-well/`（Claude 夜班、Codex 审查）。两者共享 `queue.md`，用 `~/sleep-well/NIGHT.lock` 互斥。
+反向变体是 `~/.claude/skills/sleep-well/`。两者可以读取同一份队列，但状态文件互不相同，而且只有本变体获取 `~/sleep-well/NIGHT.lock`。**一次只能运行一个变体。**
 
-## ⚠️ 你（Codex agent）通常不需要"执行"这个技能
+Codex agent 通常不直接执行任务循环。编排器会以两个全新的无记忆会话调用它：
 
-**编排逻辑全在 `bin/orchestrator.sh` 里，由 launchd 触发，不需要 AI 参与。** 这是本技能与 sleep-well 最大的结构差异 —— sleep-well 的编排器就是一个 Claude 会话，它自陈「a monitor cannot watch its own death」；这里编排器是 shell，两侧 AI 全挂时它依然活着，能重试、出早报、推送死亡通知。
+1. 实现者：任务 prompt + `prompts/implement.md`
+2. 修复者：findings 摘要 + `prompts/fix.md`
 
-你会以两种身份被这套系统调用，**每次都是全新的、无记忆的 `codex exec` 会话**：
-
-1. **实现者** —— 编排器把任务 prompt + `prompts/implement.md` 喂给你
-2. **修复者** —— 编排器把 findings 摘要 + `prompts/fix.md` 喂给你
-
-两种身份的约束都写在那两个 prompt 文件里，**以它们为准**。
-
-用户直接对你说「启动夜班 / sleep-well-codex」时，你要做的是本文档「启动与运维」一节的事，不是自己去跑任务循环。
+这些 prompt 是会话内约束的权威来源。
 
 ## 启动与运维
 
-### ⚠️ 装之前先确认三件事（2026-08-16 实测教训）
+启动前确认：
 
-1. **依赖能被 launchd 解析到。** launchd 起的是**非交互 shell**，`~/.local/bin` 之类由
-   交互式 rc 文件添加的目录**不在 PATH 里**。这台机器上 `codex` 与 `claude` 都在那儿——
-   实测整夜每 5 分钟一次「拒绝开工」，而日志说的是「MCP 未能清空」（指错了方向）。
-   编排器现在会**追加**常见位置作兜底，并在开工前做依赖预检、缺什么报什么。
-   自测: `env -i HOME="$HOME" /bin/bash -lc "$HOME/.codex/skills/sleep-well-codex/bin/orchestrator.sh"`
-2. **目标仓库必须是干净的。** 有未提交改动时任务直接转人工（避免把你的工作混进 checkpoint）。
-3. **队列内容是你现在想跑的。** `queue.md` 与 Claude 侧共享，可能是几周前留下的。
+1. macOS 上已安装 Node.js 18+、Git、Codex CLI，以及符合 README 契约的可执行 Claude 审查适配器。默认路径是 `~/.codex/skills/claude-handoff/scripts/claude-code-review.sh`，也可用 `SLEEP_WELL_CLAUDE_REVIEW` 指定。
+2. 目标仓库是干净的；`.review/` 审查产物除外，而且至少已有一个可用的 `HEAD` 提交作为 checkpoint/护栏基线。已有任务改动时编排器会拒绝开工，避免混入 checkpoint；尚无提交的仓库会把该任务如实转为 `needs_human`，不会误报护栏违规或阻断后续队列。
+3. `queue.md` 是本夜要执行的当前队列。
+4. 另一个 sleep-well 变体未在运行。
+
+可选路径覆写：`SLEEP_WELL_CODEX` 指定 Codex 可执行文件（绝对路径或可由 PATH 解析的命令名）；`SLEEP_WELL_ROOT` 改变运行状态根目录，但必须是专用绝对路径，不能是 `/` 或账户 HOME 本身；`SLEEP_WELL_QUEUE` 只改变队列文件路径。launchd 使用时必须把这些变量显式写入其环境，不能依赖交互式 shell 配置。
+
+launchd 的非交互环境不保证包含交互式 shell 的 PATH。编排器会在现有 PATH 之后追加常见的 Homebrew、用户本地和 nvm 位置，并在开工前逐项预检依赖。可用下列方式模拟精简环境：
 
 ```bash
-# 1. 配置（首次）
+env -i HOME="$HOME" /bin/bash -lc "$HOME/.codex/skills/sleep-well-codex/bin/orchestrator.sh"
+```
+
+基本操作：
+
+```bash
+# 首次配置
+umask 077
 mkdir -p ~/sleep-well/codex
 cat > ~/sleep-well/codex/config.json <<'JSON'
 { "morning_hour": "07:00", "ntfy_topic": "<换成一串长随机字符>" }
 JSON
+chmod 700 ~/sleep-well ~/sleep-well/codex
+chmod 600 ~/sleep-well/codex/config.json
 
-# 2. 装 launchd（会改系统级行为，**必须让用户自己执行**）
+# 每夜启用 launchd（必须由用户自行执行）
 cp ~/.codex/skills/sleep-well-codex/bin/com.user.sleepwell-codex.plist ~/Library/LaunchAgents/
-rm -f ~/sleep-well/STOP                                            # 清除上一夜的 STOP
-node ~/.codex/skills/sleep-well-codex/lib/cli.mjs terminal-clear   # 清除上一夜的终止标记
-launchctl load ~/Library/LaunchAgents/com.user.sleepwell-codex.plist
+if [ -e ~/sleep-well/codex/state/current-run.json ]; then
+  echo '检测到未归档 current-run.json；先核对并归档或改名隔离，暂不重新武装。'
+else
+  rm -f ~/sleep-well/STOP
+  node ~/.codex/skills/sleep-well-codex/lib/cli.mjs terminal-clear
+  launchctl load ~/Library/LaunchAgents/com.user.sleepwell-codex.plist
+fi
 
-# 3. 停止
-touch ~/sleep-well/STOP          # 当前这一夜收工
-launchctl unload ~/Library/LaunchAgents/com.user.sleepwell-codex.plist   # 彻底停用
+# 当前这一夜收工 / 完全停用：先让编排器观察 STOP 并完成归档
+touch ~/sleep-well/STOP
+# 若当前没有正在运行的 launchd 跳，手工触发一次收尾；若锁仍被持有，等待在跑跳自行收尾后再检查
+bash ~/.codex/skills/sleep-well-codex/bin/orchestrator.sh
+test ! -e ~/sleep-well/codex/state/current-run.json
+# 只有确认活动状态已经归档后，才做兜底卸载
+launchctl unload ~/Library/LaunchAgents/com.user.sleepwell-codex.plist
 
-# 4. 看状态
-cat ~/sleep-well/codex/state/heartbeat          # 最后一次有进展的时刻
+# 查看状态
+cat ~/sleep-well/codex/state/heartbeat
 tail -30 ~/sleep-well/codex/logs/orchestrator-*.log
 cat ~/sleep-well/codex/morning-report.md
 ```
 
-**`ntfy_topic` 必须是长随机串**：ntfy.sh 是公开服务，topic 名被猜到即可被订阅。推送内容已限制为任务标题与状态，不含代码、路径、findings 正文。
+`morning_hour` 必须严格使用 24 小时制 `HH:MM`（例如 `07:00`）；非法值会在初始化时失败关闭并告警，不会静默取消 cutoff。
+
+编排器在队列清空、到达 cutoff、看到 STOP 或失败关闭且状态已可靠持久化时，会写入 `TERMINATED` 并自行 `launchctl unload`。归档失败时不落 `TERMINATED`、不卸载并在下一跳重试；在收工阶段无法恢复用户 `pre-push` hook 时也保留 launchd。另一种情形必须区分：若启动阶段发现前一进程遗留的 hook 恢复材料，但因冲突、归属不明或记录/备份无效而无法自动恢复，编排器会告警一次、写入 `TERMINATED` 并自卸载，同时原样保留恢复材料；人工处理后必须重新执行 `terminal-clear` 和 `launchctl load`。这些告警只推送一次，收到后必须检查本机状态与 `current-run.json`，不能假定任务仍在后台或已经卸载。因此 plist 可保留在 `~/Library/LaunchAgents/`，但下一夜仍需重新执行上面的每夜启用流程；它不是安装一次后每天自动运行的定时任务。`terminal-clear` 在未归档的 `current-run.json` 仍存在时会失败关闭，不会清掉 `TERMINATED` 或通知标记。
+
+若没有 STOP、但 node 在已有活动 run 期间缺失或无法运行，编排器会生成明确写有“本夜已有活动运行（未归档）”的最小早报，保留 `current-run.json`，不写 `TERMINATED`、不卸载，并由下一次 launchd 触发重试；固定告警会去重。先核对目标仓库的未提交残留并修复 node，通常无需清除活动状态。若用户已明确设置 STOP，则急停优先：状态与恢复证据仍保留，但本夜会写 `TERMINATED` 并卸载。重新武装前必须先核对目标仓库；状态有效时运行 `node ~/.codex/skills/sleep-well-codex/lib/cli.mjs archive`，状态损坏或需要原样保留时按下文规则改名隔离 `current-run.json`，确认活动文件已不存在后再按每夜启用流程操作。
+
+收到「锁状态异常，无法安全验证持有者」告警时，不要直接删除锁。先用 `pgrep -af 'sleep-well-codex/bin/orchestrator.sh'` 与本机日志确认没有仍在运行的编排器，再用 `ls -la ~/sleep-well/NIGHT.lock` 记录现场，并把整个 `NIGHT.lock` 目录移动到一个人工选择的隔离名称保留证据。下一跳会重新取得锁并清除该告警的去重标记；只要仍可能有实例在跑，就保持锁原样并人工处理。
+
+若 `current-run.json` 无法解析，普通 STOP/finalize 无法归档它。先停止或卸载 launchd，并用 `pgrep -af 'sleep-well-codex/bin/orchestrator.sh'` 确认没有仍在运行的编排器；核对晨报所列日志、各任务仓库的工作树与 `git log` 后，把损坏文件移动到同目录下的 `corrupt-current-run-<人工时间戳>.json.bak` 并保留证据。隔离名不得以 `run-` 开头、也不得以 `.json` 结尾，否则晨报会把它误当作正常归档。不要删除损坏文件。确认仓库残留已妥善处理后，再移除 STOP、执行 `terminal-clear` 并重新 load。
+
+`ntfy_topic` 必须是长随机串：ntfy.sh topic 可被公开订阅。推送只包含经过截断与清洗的任务标题、状态和稳定错误类别；完整路径、堆栈、代码及 findings 正文只写本地日志。
 
 ## 队列格式
-
-`~/sleep-well/queue.md`（与 sleep-well 共享，格式相同）：
 
 ```markdown
 ## 修复 foo 的空指针
@@ -73,242 +93,109 @@ cat ~/sleep-well/codex/morning-report.md
 > 详情写在引用块里，会作为 prompt 传给实现者。
 ```
 
-`id` 必填且唯一，**可以是中文、含空格、含 `..`**（queue.md 与 Claude 侧共享、由你手写）——只拒绝两类：**路径分隔符**（`/` `\`）与**控制字符**（按 Unicode `Cc` 类，含 C0/C1/DEL——NUL 经 shell 命令替换会被静默丢弃导致任务永远推不动，而 U+009B 这类 C1 字符能改变终端显示、伪造日志）。
-路径安全**不由 id 承担**：派生文件名由 `safe_id` 生成（非 `A-Za-z0-9._-` 的字节全部编码为 `_`、强制 `t_` 前缀避免隐藏文件、再拼**128 位**哈希防撞名——8 位十六进制只有 32 位边界且可构造碰撞，Codex R18 给出了实例；**哈希不可得时失败关闭**，不静默降级）。代价是全中文 id 的日志文件名是一串下划线加哈希——唯一但不可读。
-`repo` 必须是 git 仓库（否则任务直接标 needs_human）。`priority` / `files` 若填写必须是整数，空值或非整数会**整队拒绝解析**并落「夜班未开工」——手写 Markdown 最常见的错就是漏填。
+`id` 必填且唯一，可以含中文、空格和 `..`，但不能含 `/`、`\` 或 Unicode 控制字符。显示 id 与派生文件名分离：`safe_id` 会编码不安全字节、加可见前缀和 128 位哈希；无法计算哈希时失败关闭。
 
-## 一跳的语义
+`repo` 必须是 Git 仓库或 Git worktree 的**顶层目录**，不能指向其中的子目录。本发布版还要求该仓库没有关联其它 linked worktree（linked-worktree checkout 本身也会被拒绝），并且不含子模块 gitlink；见已知限制「Git 元数据护栏只支持单一完整工作树与默认 hooks 目录」。`priority` 和 `files` 若存在必须是整数；空值或非整数会让整份队列拒绝解析，而不是静默采用默认值。
 
-抢到锁的那一跳**一直工作到收工**（队列清空 / 过 cutoff / 两侧 AI 不可用）。
+## 运行与恢复模型
 
-⚠️ 这里原本写的是「launchd 后续触发发现锁被占就毫秒级退出」——**那个机制并不存在**：`launchd.plist(5)` 规定 job 运行期间的 interval 会被丢弃，根本不会有第二个实例来发现锁被占（见下节）。结论（空转零额度）仍成立，但理由是错的。这句话与下一节直接矛盾，而它在同一份文档里存在了两轮——我 R11 查清 launchd 语义后只改了新写的那段，没回头修早就写下的这句。**抢锁逻辑保留，是为手工调用与异常并发兜底。**
+待处理任务和可用性退避可跨 launchd 触发恢复。计划内跳退出会在完成事后护栏核验后，把与当前 run 绑定的退出证明原子写入状态；下一进程只消费一次该证明并续跑在途任务。证明缺失、损坏或不属于当前 run 时按进程级异常终止处理：在途任务保守转人工，同一仓库由 `dirtyResidue` 继续阻塞，直至用户核验并清理。正常捕获到的单次 AI 失败仍会先完成事后护栏核验，再按下表中继。
 
-等价于「长驻工作进程 + 5 分钟粒度的死亡自动重启」：进程崩了，下一次触发从磁盘状态续跑。
+抢到锁的一次调用会持续工作，直到队列清空、到达截止时间、看到 STOP，或两侧 AI 都不可用。launchd 在 job 运行期间会丢弃 interval 触发，不会启动并发副本；文件锁仍用于手工调用和异常并发的防御。
 
-**挂起与崩溃不同，需要单独兜底**（R8 自查 + R9 #1 纠正）：崩溃会释放锁，挂起不会。一个卡死但活着的持有者能霸占 `NIGHT.lock` 到天亮——整夜零产出、**无早报、无推送**。
+挂起进程不会像崩溃那样释放锁，因此编排器内置分层有界机制：
 
-⚠️ **不能靠「下一跳来接管」**。`launchd.plist(5)` 原文：*"If the job is running during an interval firing, that interval firing will likewise be missed."* 持有者挂起时 launchd 根本不会起第二个实例。R8 我把接管逻辑写在 `acquire_lock` 里，那是**死代码**。
-
-现在是三道防线，全在**本进程内**：
-
-| 机制 | 作用 |
+| 机制 | 行为 |
 |---|---|
-| `AI_TIMEOUT_SECS`（默认 1800） | 单次 codex/claude 调用超时即终止**该调用的进程组**，返回 124 |
-| 进程内看门狗（自成进程组的子进程） | 心跳停滞超 `HANG_LIMIT_SECS`（默认 2700）即①终止分离的 AI 子进程组 ②递归终止父进程树，让 EXIT trap 跑完（释放锁、恢复 hook），下一跳才能续跑出早报 |
-| `run_with_timeout` 轮询期间刷新心跳 | 使「无心跳」只可能发生在**有界调用之外**——正是看门狗该管的范围，两者不重叠也不留缝 |
+| `SLEEP_WELL_STARTUP_TIMEOUT`（默认 15 秒） | 在主看门狗武装前，把锁 owner 的 `ps` 探针、终止态 hook 恢复与自卸载限制在独立进程组内 |
+| `SLEEP_WELL_AI_TIMEOUT`（1–86400 秒；默认 1800） | 单次 AI 调用超时后终止该调用的独立进程组 |
+| `SLEEP_WELL_HANG_LIMIT`（1–87300 秒；默认 2700） | 心跳停滞后，看门狗先终止活动 AI 进程组，再终止编排器后代并让 EXIT trap 清理锁和 hook；若不大于 AI 超时，会自动设为 AI 超时加 900 秒 |
+| `SLEEP_WELL_WATCHDOG_POLL`（1–300 秒；默认 30） | 进程内看门狗的轮询间隔；越界值压入范围并记录告警 |
+| `SLEEP_WELL_WATCHDOG_GRACE`（3–300 秒；默认 30） | TERM 后升级 KILL 前的宽限期；越界值压入范围并记录告警 |
+| 调用轮询心跳 | 长调用期间持续刷新心跳，避免被误判为编排器挂起 |
 
-两个阈值在开工前校验（非数值回落默认、`HANG_LIMIT` ≤ `AI_TIMEOUT` 自动抬高），弄反不会导致看门狗杀掉正常调用。
-
-### 「杀谁」这件事错了两次，两条教训都要记住
-
-**(a) 编排器不是进程组组长**（R10 自查实测）。三种启动方式下 `pgid` 都不等于 `$$`：
-
-| 启动方式 | `$$` | pgid |
-|---|---|---|
-| shell 直接启动 | 12673 | 12669 |
-| 管道中 | 12680 | 12669 |
-| 由 wrapper 脚本调用 | 12690 | 12669 |
-
-所以 `kill -TERM -$$` 要么打到一个不存在的组（失败后静默回退成单进程 kill，**「整组终止」的意图落空**），要么打到一个同号的**无关**进程组。⇒ 看门狗改为递归杀父进程的**进程树**（`pgrep -P` 后序遍历，跳过自己——不跳过就在第一刀砍掉自己，KILL 升级永远到不了）。
-
-**(b) AI 子进程根本不在父进程的组里**（R10 #1）。`run_with_timeout` 用 `set -m` 把它放进了自己的组（实测 `pid == pgid`，这半边一直是对的）。父进程停滞时那个轮询循环也停了，没人去终止那个**分离的**组；看门狗只杀父树的话，AI 进程会在锁与 hook 都恢复之后**继续往仓库里写**——R9 #2 要根除的问题换条路径复发。⇒ 活动子进程组号写进 `state/active-pgid`，看门狗先杀它，再杀父树。
-
-**(c) bash 3.2 里子 shell 的 `$$` 仍是父进程的 PID**（R11 #1，实测；bash 3.2 也没有 `BASHPID`）。看门狗原本用 `wd_self=$$` 来「跳过自己」，而那个值恰好等于编排器的 PID —— 于是 `_kill_tree` 跳过的正是**编排器本身**：AI 组杀了，卡死的编排器毫发无损，锁一直占着。改用 `sh -c 'echo $PPID'` 取子 shell 真实 PID，取不到就直接退出（宁可不看门，也不能误杀编排器）。
-
-**(d) `pgrep -P` 是快照，被杀进程在收到 TERM 前还能 fork**（R11 #5）。新孩子不在快照里，父死后被 reparent 到 init，后续遍历再也找不到。**后代**因此先 `SIGSTOP` 再枚举（STOP 不可捕获，冻住就 fork 不了），且随后直接 `KILL`——SIGKILL 对 stopped 进程直接生效，不需要 CONT，所以不存在「STOP 成功但 CONT 没发出去 → 目标永久停在状态 `T`」的窗口（R12 #1，实测过那个危害）。
-
-**(e) 根进程（编排器）不能 STOP**：它要收 TERM 才能让 EXIT trap 跑完（释放锁、恢复 hook），而 TERM 发给 stopped 进程会一直挂起。代价是**已知残留**：根在收到 TERM 之前还能再 fork 一次，那个孩子会在根退出后被 reparent 而逃出后续遍历（R13 #3）。这一条没有解决，写在这里而不是假装解决了。
-
-**(f) AI 子进程组要先给宽限期**（R13 #2）：它虽有独立 PGID，但仍是编排器的**后代**——若紧接着就扫树，`_kill_descendants` 会立刻把它 STOP+KILL，前面那句优雅 TERM 根本没机会生效，正在写文件的 codex 会被拦腰砍断。顺序是：TERM AI 组 → 等宽限 → KILL AI 组 → 清后代 → TERM 根 → 等宽限 → 收尾。
-
-超时升级只对**进程组**做且先确认它还在（R10 #3）。`state/active-pgid` 记的是「owner_pid pgid」，看门狗只在 owner 等于当前编排器时才采信，开工前还清一次残留——否则上一次运行被 KILL 留下的陈旧号会被拿去对已复用的进程组发信号（R11 #4）。**这是我在 R10 修完超时路径后，转头又在看门狗路径上重犯的同一个缺陷。**
-
-另：`codex exec` 在 stdin 未关闭时会打印 `Reading additional input from stdin...` 并**无限等待**，所以所有调用都带 `</dev/null`。这是我自己的负测试挂住之后才发现的——生产里只是碰巧靠 launchd 默认给 `/dev/null` 才没炸。
+AI 与 HANG 两个阈值会在开工前校验；非整数或超出表中范围会在任何 AI 调用前失败关闭、写入区分“无活动运行/已有活动运行”的配置错误早报、推送一次固定告警并释放锁，已有活动状态保持待续。POLL 与 GRACE 的非整数会回落默认值，越界值会压入表中范围并记录本机告警。若存在待恢复的 pre-push hook，早报与告警会明确提示修复配置前 `git push` 可能被阻断。若 AI/HANG 配置非法但已有 `STOP`，编排器只为完成急停收尾临时采用安全默认值，仍会归档活动状态；若 node 已缺失，则如实提示活动状态未归档并原样保留，绝不称为“没有活动运行”。活动进程组记录包含 owner PID；陈旧或 owner 不匹配的记录不会被采信。所有 AI 调用都关闭 stdin，避免 CLI 等待附加输入。受保护路径扫描不生成与实际进展无关的合成心跳；若 `find`、哈希或文件系统 I/O 卡死，心跳会变陈旧并由看门狗接管。
 
 ## 审修循环
 
-每个任务：实现（**不 commit**）→ `claude-handoff` 审查未提交 diff → `decideNext` 判定 → `done` 才 checkpoint。
+每个任务按以下顺序运行：
 
-**findings 条数是机读的，不经模型判断。** sleep-well 的 SKILL.md 要求「YOU read agentText, extract each distinct issue」—— 让模型去数条数，那正是 codex-handoff 2026-07-23 事故的根源（实际 24 条，只处置了输出 preview 里可见的 18 条）。claude-handoff 出结构化 findings，元信息头直接写 `findings 条数: N`，编排器 grep 即得，并断言「处理状态骨架条目数 == N」。
+`实现（不提交） → 独立审查未提交 diff → 记录并验证 findings → 修复或转人工 → 重新审查 → 零 findings 后 checkpoint`
 
-**失败关闭**：claude-handoff 的契约是「findings 文件存在 ⟺ 该轮审查完整可信」。文件不存在时**绝不**当作「零 findings 通过」—— 是可用性问题就走额度中继，其它原因一律标 needs_human。
+findings 数量来自适配器产生的结构化 Markdown，并同时校验元信息、逐条标题和处理状态骨架。文件缺失、计数不一致或格式不可信都按审查失败处理，绝不解释为零 findings。
 
-## 额度中继
+审查适配器应把输出写在目标仓库之外，或写入目标仓库的 `.review/`，且不得修改其它仓库内容。基线检查和 checkpoint 都排除 `.review/`；适配器返回后、任何判定或 checkpoint 前，编排器会核验引用与受保护路径，并比较审查前后的 Git 可见工作内容和索引快照。findings 的规范化真实路径若落在仓库内但不在 `.review/`，会在记录前被拒绝。
+
+高严重度 finding 不自动修复；任务转为 `needs_human`。非高严重度 finding 的自动修复受轮数与停滞判定限制。
+
+## 可用性中继
 
 | 情形 | 动作 |
 |---|---|
-| Claude 额度耗尽 | `defer-review`: **跳过本轮审查**（不再打一次注定失败的调用），任务标 `reviewDeferred`，继续做实现工作，下跳重试 |
-| Codex 额度耗尽 | `fix-only`: **不取新任务**；在途任务仍会重试一次——那正是探测「Codex 是否恢复」的手段 |
-| 两侧都耗尽 | 本跳退出，下跳再探（launchd 每 5 分钟自然重试，零成本） |
-| 任一侧**认证**失效 | 立即收工并推送 —— 重试无用，需人工 `claude login` / `codex login` |
+| Claude 暂时不可用 | 暂缓审查并保留任务状态，下一次 launchd 触发重试 |
+| Codex 暂时不可用 | 不取新任务；允许在途任务探测恢复 |
+| 两侧都暂时不可用 | 当前调用退出，下次触发重试 |
+| 任一侧认证失效 | 收工并推送稳定错误类别，等待人工重新登录 |
 
-**恢复以「实际成功」为证据**（R13 #1）：某一侧调用成功即把它置回 `ok`。原来只有 `decideHop` 判定「两侧都 ok」时才 `availability-reset`——而在 `fix-only` 状态下 Codex 恢复了也没人置回，于是永远停在 `fix-only`、拒绝每一个待办任务，最后误报「退避耗尽」。
+某一侧的实际成功调用是恢复证据；成功后清除该侧的不可用标记。
 
-因为有 5 分钟心跳，中继退化成「没到点就 exit 0」，不需要计算唤醒时刻，也就不会算错而睡过头。
+## 护栏
 
-⚠️ **这张表里的 `defer-review` / `fix-only` 在 R12 之前只存在于注释里** —— `decideHop` 算出了它们，主循环的 `case` 却只处理 `halt`/`idle`，于是「Codex 额度耗尽就不取新任务」这条承诺**根本没有实现**：照样取新任务、照样去调那个已知不可用的一侧。文档描述了一个不存在的行为整整十一轮。现在四个 action 都落到行为上，并有端到端断言（codex 报额度耗尽后，下一跳对它的 exec 调用次数为 0）。
+Codex 子进程使用 `workspace-write` 沙箱，关闭 shell 网络访问，并使用隔离的 `CODEX_HOME`。编排器自身以 `umask 077` 保护运行时状态；进入目标仓库的 Codex 子进程重设为常规 `umask 022`，避免把新增源码静默建成 0600/0700。原生网页工具不受 shell 网络沙箱约束，所以隔离配置必须把 `web_search = "disabled"` 放在任何 TOML 表头之前。`bin/probe-native-web.sh` 提供带正对照的人工回归探针，会把调用方的 `CODEX_HOME` 规范化成绝对路径，再为两个探针 home 链接并复验同一登录态；它会发起真实模型调用，因此不属于常规测试。
 
-## 护栏（主门禁是进程级沙箱，但**它只管 shell**）
+独立审查适配器不在 Codex 进程沙箱中，而是以当前运行账户的完整权限执行。事后核验只覆盖目标仓库内的内容、索引与 Git 元数据；适配器写入仓库外的 `~/.gitconfig`、shell 启动文件或 launch agent 等既不会被阻止，也不会被检出，后续 Git 命令还可能读取这些变化。只能使用可信适配器；需要更强边界时应使用专用低权限账户或一次性环境。
 
-**Codex 子进程跑在 `codex exec -s workspace-write -c sandbox_workspace_write.network_access=false` 里。** 2026-08-10 用 `codex sandbox` 子命令实测（带正对照）：
+`pre-push` hook 只作纵深防御，不能阻止 `--no-verify`。编排器会保存、标识并恢复已有 hook；无法确认所有权时失败关闭并保留恢复材料。
 
-| 向量 | 结果 |
+每次 Codex 调用后，以及每次独立 Claude 审查适配器返回后，编排器都会在 AI 进程之外核验：
+
+| 核验 | 检测目标 |
 |---|---|
-| 工作区内写 | ✓ 允许（正对照，证明沙箱确实生效） |
-| 工作区外写 | ✓ 阻断 `Operation not permitted` |
-| push 到工作区外 bare，带 `--no-verify` | ✓ 阻断 `remote rejected` |
-| **shell 发起的**网络访问 | ✓ 阻断 |
-| **原生网页工具发起的网络访问** | ✗ **不阻断**——见下 |
-| `/tmp` 等临时目录 | ⚠️ 放行 —— seatbelt 的可写根，设计如此 |
+| `rev-list <preSha>..HEAD` 为空 | 未授权 commit 或 merge |
+| merge/squash 标记不存在 | 未完成或 squash merge |
+| `refs/heads` 前后一致 | 分支创建、删除、reset、fast-forward |
+| 受保护路径哈希一致 | 合同、法务和凭据类文件变化，包括未跟踪文件及受保护符号链接目标 |
+| Codex 回合前后 `.review/` 保留区快照一致 | 实现者在审查保留区隐藏或遗留任何内容 |
+| 审查前后 Git 可见内容与索引快照一致 | 独立审查器修改 tracked 或未忽略的 untracked 源码、文件模式或暂存区 |
+| Git 默认 hooks/config/安全相关 info 元数据快照一致 | 实现者或审查器安装 hook、filter、fsmonitor，改写 exclude/attributes/sparse-checkout/grafts/对象 alternates；checkpoint 另以 `core.hooksPath=/dev/null` 禁用 hook。`info/refs`、packs、commit-graph 等 Git 后台维护缓存不纳入，避免 auto-gc 假告警 |
 
-### ⚠️ 原生工具不走 shell，要靠 `web_search` 配置关掉 —— 而 TOML 位置是关键
-
-seatbelt 管的是 codex 派生的 shell 进程；**Responses API 侧的原生工具在 codex 自己的进程里发请求，完全不经过沙箱**，`network_access=false` 对它们无效。
-
-唯一有效的开关是**顶层** `web_search = "disabled"`。「顶层」这两个字是全部的重点：
-
-```toml
-sandbox_mode = "workspace-write"
-web_search = "disabled"        ← 必须在任何 [表头] 之前
-
-[sandbox_workspace_write]
-network_access = false
-```
-
-TOML 的表不会因空行回到根级。写在 `[sandbox_workspace_write]` 之后，它就变成 `sandbox_workspace_write.web_search` —— 一个语法合法、谁都不读的**死键**。
-
-2026-08-10 配对负测试（同提示同模型各跑两次，判据是 `web search:` **工具调用事件**而非模型自陈）：
-
-| 配置 | `web search` 事件 | 拿到 example.com 的 `<h1>` |
-|---|---|---|
-| 键写在 `[sandbox_workspace_write]` 之后 | 2 / 2 次 | 2 / 2 次 |
-| 键写在顶层 | **0 / 2 次** | **0 / 2 次** |
-
-回归探针：`bin/probe-native-web.sh`，**自带正对照**（2026-08-11 重跑: 正对照 2 次工具事件 + 拿到 `<h1>`，受测 0 次——结论在当前 Codex 版本上仍成立）（刻意放错位置的那份必须能打开 URL，否则整个探针判定不成立）。Codex 升级后重跑。
-
-> 这是本项目第六次「配置被接受」被误当成「行为被改变」（前五次：`--allowedTools`、`pre-push` hook、`-c mcp_servers='{}'`、`[tools] web_search=false`、以及本条的位置错误）。最后这次尤其阴：**键名对、位置错**，于是 R7、R8 两轮我和 Codex 双方都拿着同一份坏配置做负测试，一起得出了「关不掉」的错误结论，直到 R9 指出 TOML 语义。
->
-> **判据必须是可观测的工具事件，且必须有正对照。** `computer_use` 那次就因为正对照失败而不成立：A/B 两种配置都返回 `NO_COMPUTER_USE`，说明该工具在 `codex exec` 上本来就不提供，与开关无关——阴性结果什么也证明不了。
-
-**⚠️ `pre-push` hook 不是门禁，只防手滑。** 实测 `git push --no-verify` 与 `git -c core.hooksPath=/dev/null push` 都能绕过。它在这里仅作纵深防御，且会**保存并恢复**你原有的 hook（否则夜班跑一次就永久破坏你自己的 push 流程）。
-
-编排器另在 Codex 进程之外做事后核验（Codex 绕不过，因为不在它的进程里）：
-
-| 核验 | 抓什么 |
-|---|---|
-| `rev-list <preSha>..HEAD` 为空 | 普通 merge、野生 commit |
-| `.git/{SQUASH_MSG,MERGE_HEAD,MERGE_MSG}` 不存在 | `--squash`、未完成的 merge |
-| `for-each-ref refs/heads` 前后一致 | `--ff-only`、reset、建删分支 |
-| 受保护路径 sha256 前后一致 | 合同/法务/凭据类文件被改（含未跟踪的新增文件） |
-
-任一核验失败或**核验本身失败**（命令出错）→ 中止整夜 + 推送告警。
-
-**开工前要求干净基线**：仓库若已有你自己的未提交改动，任务直接转人工不开工 —— 否则收尾的 `git add -A` 会把你的无关工作一并提交进 checkpoint。
+任一核验失败，或核验命令本身失败，都会中止整夜并告警。
 
 ## 已知限制
 
-1. **读取范围是整个用户账户，不是入队的那个仓库**（R3 + R9 #15，**本技能最重的限制**）：
-   - `workspace-write` 阻断仓库外**写入**，但**不阻断读取**——Codex 能 `cat` 本机任意可读文件：
-     `~/.ssh`、别的项目、乃至软链进隔离 home 的 `auth.json`。
-   - 所以「只入队不含敏感数据的仓库」**不是有效边界**——一个干净仓库里的提示注入照样能去读账户里的任何东西。
-     这是 Codex R9 #15 纠正我的：我原先把边界写成仓库级，那是错的。
-   - 读到的内容会进入模型上下文（即发往 OpenAI）。这是用云端模型的固有代价，不是本技能引入的。
-   - **URL 静默外带通道已关闭**（顶层 `web_search = "disabled"`，见上节配对负测试）。
-     R8 那版文档说它关不掉，是因为配置位置写错了；现在有探针守着这个结论。
+1. `workspace-write` 限制仓库外写入，但不限制读取。模型能读取运行账户下任何可读文件；若需更强边界，应使用专用低权限账户或隔离环境。
+2. macOS 沙箱允许写临时目录，例如 `/tmp`。
+3. 未跟踪的受保护文件会备份到 `~/sleep-well/codex/backups/`，当前没有自动清理策略；凭据副本可能长期累积。
+4. `~/sleep-well/codex/logs/` 会保留完整 Codex 输出、审查 stderr 与 findings 副本，可能含仓库路径和代码片段；当前没有自动清理策略，且清理 `.review/` 或 `backups/` 不会清理这些日志。需定期核对并仅删除已确认不再需要的单个日志文件。
+5. 文件超出 `SLEEP_WELL_BACKUP_MAX_BYTES` 或备份失败时会告警但不阻止开工。护栏仍能检测变化，但没有可恢复副本。
+6. 两个变体的互斥是单向的。只有本变体获取 `NIGHT.lock`，所以不得并发运行。
+7. 本变体有进程沙箱与事后仓库核验；`sleep-well` 变体由模型按 SKILL 指令调用 helper，本仓库未提供进程级 PreToolUse hook。
+8. 本变体不做 Idle discovery，也不做团队委派；队列为空即收工。
+9. 法务关键词只覆盖英文及中日文常见词。其它语言可能漏保护；判定刻意保守，日语 `合同テスト`、源码路径 `contracts/`、`contract*.ts`、`agreement*`、`nda*`、`legal*` 等也可能被当作法务内容。Codex 变体一旦检测到这类路径在任务中变化会中止整夜并自卸载；含这些普通源码路径的仓库不适合无人值守。当前选择安全默认：宁可误保护并提示，也不放过潜在法务文件。
+10. `.review/` 是审查适配器的保留命名空间，始终从任务基线、受保护路径快照与 checkpoint 排除，但 Codex 实现/修复回合会单独做前后内容快照；实现者的任何写入都会中止整夜。目标仓库若已跟踪 `.review/` 下的任何文件，编排器会在调用 AI 前把任务转为 `needs_human`；这类仓库不能无人值守运行。编排器不会自动清理适配器留下的审查正文；建议在目标仓库的 `.gitignore` 中忽略 `.review/`，并在确认不再需要审计记录后定期逐项清理，避免被手工 `git add -A` 带入历史。
+11. findings 正文是模型生成文本，且可能受被审仓库内容影响，因此是不可信输入。修复轮只把它当作问题证据；原始任务与内置修复提示是唯一授权来源，findings 不能扩大任务范围、权限或允许的操作。
+12. 审查适配器的只读内容快照不哈希未命中受保护路径规则的 Git ignored 文件。这避免每轮递归哈希 `node_modules/`、构建与缓存树；若普通 ignored 产物也必须不可变，应在专用低权限账户或一次性隔离环境中运行审查器。
+13. 看门狗终止挂起的编排器时，会先冻结并清理已发现的后代，再向根进程发送 TERM 以便 EXIT trap 释放锁并恢复 hook。根进程不能先 STOP，因此在收到 TERM 前仍有一个极窄的再次 fork 窗口；新子进程可能被 reparent 而逃过清理。异常收工后应检查是否仍有属于本夜的 Codex/审查子进程，不要仅凭锁与 hook 已恢复就断言所有写入进程都已退出。
+14. 本发布版的 Git 元数据护栏只支持单一完整工作树与默认 hooks 目录。含子模块 gitlink、关联其它 linked worktree、有效配置了自定义 `core.hooksPath`、启用了 `extensions.worktreeConfig`，或仓库本地 `.git/config` 使用 `include.path`/`includeIf` 的任务会在任何 AI 调用前转为 `needs_human`；这些额外 gitdir/配置片段与自定义 hook 位置不做无人值守处理。
+15. 独立审查适配器是账户级全权限进程，不受 Codex 沙箱约束；仓库外写入不在事后护栏范围内。被审仓库内容可能影响模型输出，因此应只用可信适配器，并在敏感环境使用专用低权限账户或一次性隔离环境。
+16. 归档失败或非 STOP 的活动 run 遇到 node 不可用时，编排器刻意不写 `TERMINATED`、不卸载并继续定期重试；收工阶段的 hook 恢复失败也保留 launchd。明确 STOP 时即使 node 不可用也会保留活动状态、写入 `TERMINATED` 并卸载。启动阶段遇到遗留 hook 的恢复冲突、归属不明或材料无效时同样写入 `TERMINATED` 并卸载，只保留材料等待人工处理和重新 load。对应告警用持久标记去重，只发送一次。
 
-   **⇒ 真正的边界是「这个用户账户里可读的一切」。** 想收得更紧只有换环境：
-   专用低权限账户、容器，或不装。
+## 共享模块
 
-   **用户决定（2026-08-10）**：在「关不掉网页工具」这一（后来证明错误的）前提下，用户选择**接受风险、自己在入队时把关**，不做白名单硬门禁。R9 之后前提有两处变化——外带通道其实关得掉（风险变小），但读取边界是账户级而非仓库级（边界比当时说的宽）。**这两点已如实回报给用户，是否据此调整由用户决定。**
-   
-   若要把「自己把关」变成代码约束：在 `_process_task` 取到 `repo` 后加一层白名单校验（不在 `~/sleep-well/allowed-repos` 里就 `needs_human`）。当前**刻意没有**这一层。注意它只能限制「在哪个仓库干活」，**限制不了读取范围**。
-2. **沙箱不覆盖 `/tmp`**：seatbelt 把临时目录列为可写根。Codex 可以在 `/tmp` 下写文件、甚至推本地 bare 仓库。风险低但不为零。
-3. **备份会长期积累凭据副本，且没有清理策略**（R14 扫查补入）：`guard_snapshot` 会把受保护且未被 git 跟踪的文件（典型如 `.env`）复制到 `~/sleep-well/codex/backups/<日期>/`。按日期新增、**永不删除**。保留多久、何时删，属于数据保留政策——**未获授权前本工具不会自动删任何备份**。
-4. **备份不是护栏，失败不阻塞开工**（R14 扫查补入）：文件超过 `SLEEP_WELL_BACKUP_MAX_BYTES`（默认 10 MiB）或备份命令失败时，记日志**并推送告警**（超限那一支的推送是 R15 补的——原来只 log，而文档已声称会告警），夜班照常进行。此时该文件仍受护栏**检测**（改动会被检出并中止整夜），但**没有副本可还原**。检测与可还原是两件事。
-5. **互斥是单向的**：Claude 侧的 sleep-well 目前**不抢** `NIGHT.lock`。真互斥需同步改它的启动自检。在改之前，只能保证「本技能不会踩正在跑的 sleep-well」，反之不成立。
-6. **护栏在 Codex 侧弱于 Claude 侧**：Claude Code 能在每次工具调用前置检查；这里是「沙箱 + 事后核验」的组合，`部署 / 迁移数据库 / 批量删除` 这三类**没有**进程外核验兜底，只靠 prompt 约束。
-7. **不做 Idle discovery**：sleep-well 的 Phase 4（自动找活干）未移植 —— 那是最容易「为了找活而降低安全标准」的部分。队列空了就收工。
-8. **法务关键词的语言覆盖与歧义**（R20 补入，Codex 列为需人拍板）：受保护路径的法务关键词只覆盖
-   `contract` / `legal` / `nda` / `agreement` 与中日文的「合同」「契約」「法律」。
-   - **漏**：德语 `Vertrag`、法语 `contrat` 等其它语言的合同文件不受保护。
-   - **误**：日语 `合同テスト`（联合测试）、`合同練習` 这类词仍被判为受保护——「合同」在片段
-     开头，前边界成立；要排除它就得两边都要边界，而那会误排除 `契約書`。
-   当前取**安全默认**：宁可误保护（那个仓库会中止整夜、你立刻会发现），也不漏保护
-   （凭据被改而无人知晓）。若你的队列里有大量此类日语命名，告诉我，这是可调的。
-9. **不做团队委派**：sleep-well 的 Phase 3 依赖 Claude Code 的 Workflow 工具，Codex 无等价物。
+`queue`、`state`、`guardrails`、`config`、`reviewLoop`、`backup`、`report` 及对应测试是复制型共享文件，发布版本必须逐字节一致。`scripts/check-shared-parity.sh` 负责验证。`findings` 与 `quota` 虽在两侧同名但因读取方式和额度编排职责不同而刻意发散，不进入 parity 检查；`route`、`discovery`、`ics` 只属于 Claude 变体。
 
-## 模块来源
+同名 guardrail helper 的接入边界不同：本变体把受保护路径判定接入进程外哈希核验；Claude 变体依赖 SKILL 指令主动调用，不能描述为进程级强制。
 
-`queue` / `state` / `guardrails` / `config` / `findings` / `reviewLoop` / `backup` 七个模块从 `~/.claude/skills/sleep-well/lib/` **原样复制**（纯逻辑，与审查者是谁无关）。`report.mjs` 仅恢复提示语一处参数化。改共享逻辑时两边都要改。
+## 测试与维护
 
-⚠️ **`guardrails.mjs` 里只有一半在本技能里现役**（Codex R17 指出）：`isProtectedPath` 经 `protected-in` 接进了 `_prot_hash`，是真门禁；而 **`classifyCommand` 没有任何生产调用者**——只有 `cli.mjs check-command` 这个入口和单测。在 sleep-well 那边它是现役的（Claude Code 能在每次工具调用前置检查），Codex 侧没有等价钩子，**这里的门禁是进程级沙箱**。保留它是为了与 sleep-well 保持同源，**不要把它当成本技能的现役控制**。
+```bash
+npm test
+```
 
-`route.mjs` / `discovery.mjs` / `ics.mjs` 不复制 —— 它们分别只服务团队委派与 Idle discovery，本技能不做。
+常规套件包括 Node 单测，以及 `prot-hash`、hook 状态机、看门狗和完整夜班 E2E shell 测试。`probe-native-web.sh` 需要真实模型调用，只在 Codex 升级后单独运行；它使用 `CODEX_HOME`（默认 `~/.codex`），登录态缺失时会在发起调用前明确失败。
 
-`claudeReview.mjs` 与 `quota.mjs` 是本技能新写的。
+共享对等检查只能在同时包含两个变体的**源码仓库根目录**运行：`./scripts/check-shared-parity.sh`。安装后的单个技能目录不包含该脚本，也不具备另一棵源码树。
 
-## 测试
+发布前运行完整测试和共享对等检查。公共 SKILL 只保留当前操作约束；不要追加内部评审日记、个人机器事件记录或未公开项目细节。
 
-`npm test` = 65 单测（.mjs）+ 99 项 shell 测试（合计 164）：
-
-| 套件 | 覆盖 |
-|---|---|
-| `test/prot-hash.test.sh`（20） | **性质断言**: 对每个权威判定为受保护的对象，逐个「改它 → 快照必须变」；含嵌套目录链接、成环、含换行文件名、仓库根链接、不可读文件失败关闭 |
-| `test/hook-state.test.sh`（34） | hook 状态机 12 个场景，按「用户的 pre-push 最终是什么」断言；含 token 随机性与尾随空行 |
-| `test/watchdog.test.sh`（9） | **看门狗真的开枪吗**: 卡死的编排器有没有被杀、EXIT trap 有没有跑到、健康时会不会误杀、持续 fork 下有无残留、陈旧 active-pgid 是否被忽略 |
-| `test/e2e.test.sh`（36） | 假 codex/claude 跑完整一夜 + 超时路径 + 备份链 + 额度中继 |
-
-前两套是 R8 才补的，此前 `_prot_hash` 与 hook 状态机**零自动化覆盖**——而它们各自复发了五次。
-
-**每轮新增断言都拿上一轮的代码验证过检出能力**（不能检出旧缺陷的回归测试等于没有）：
-R7 版触发 7 / 13 条失败，R8 版 3 / 1 条，R9 版 2 / 2 条，R10 版 3 条（看门狗）。
-
-⚠️ **`watchdog.test.sh` 的挂起场景我写错过两次，两次都「通过了带缺陷的旧代码」**：用 `sleep 600` 时看门狗只杀掉 sleep 子进程、脚本随即自然结束，看着像被终止；改用 `read < fifo` 时阻塞被打断、照样自然退出。只有**纯 shell 忙等**（无子进程、不会被打断后返回）才能让「只有信号能结束它」成立。测试本身也要做正对照。
-
-⚠️ 三个 shell 测试都用 `# >>>TESTABLE:xxx>>>` 标记对从 `orchestrator.sh` 抽函数，并做**抽取自检**（区块里必须含指定符号，否则响亮失败）。原来按「到下一个行首 `}`」启发式抽取——R9 里我加了个含行首 `}` 的小函数，抽取范围当场静默截断，10 项挂 9 项而被测函数完全正常。**抽取失败必须是响亮的失败，不能变成「测了别的东西还通过」。**
-
-`bin/probe-native-web.sh` 不在 `npm test` 里（要花一次真实模型调用），Codex 升级后单独跑。
-
-## Learned
-
-- (2026-08-10) **`lib/state.mjs` 的 `loadState` 在文件缺失时抛 ENOENT、空文件时抛 SyntaxError，不返回 null**。编排器把「没有活动 run」当成正常状态，必须自己用 `existsSync` + 非空判断守住，否则一个正常的空状态会被当成崩溃。`archive` 也必须**删除**状态文件而非清空 —— 清空后下一夜 `JSON.parse("")` 会抛。
-- (2026-08-10) **早报生成器要能在零 AI 会话下工作**，这是 shell 编排器相对 AI 编排器的核心价值：两侧 AI 全挂的那一夜，恰恰是最需要一份「本夜未能开工，原因 X」的时候。`bin/report.mjs` 只读磁盘。
-- (2026-08-10) 布局把 Codex 侧整体收进 `~/sleep-well/codex/`，是为了让 `lib/report.mjs` 里 `stateDir = join(home,"state")` 的硬编码假设成立 —— 这样那个 208 行的模块可以几乎原样复制。**迁移共享模块时，先看它对目录结构做了什么假设，再决定是改模块还是改布局**；改布局通常更便宜。
-- (2026-08-10, R8) **「配置被接受」≠「行为被改变」，这个项目栽了五次**：`--allowedTools`、`pre-push` hook、`-c mcp_servers='{}'`、`[tools] web_search=false`、顶层 `web_search="disabled"`。每次都是写下一个看起来对的键就宣布问题解决。**唯一可信的判据是行为负测试，而且必须带正对照** —— `computer_use` 那次就因为正对照失败（A/B 都返回 `NO_COMPUTER_USE`）而不能得出「开关有效」的结论。`--strict-config` 也不是判据：它连 `definitely_not_a_real_key` 都放行。
-- (2026-08-10, R8) **同一个函数连改五版、每版都出缺陷，说明缺的不是第六个用例，是一条性质断言**。`_prot_hash` 的加覆盖→加性能破覆盖→修错位置→修覆盖破性能，四次回归全部被「快照 ⊇ 权威判定」这一条断言抓住。性质断言还有个好处：新增受保护模式时不用改测试。
-- (2026-08-10, R8) **为性能而复制一份判定逻辑，是在制造发散**。R7 的 shell `-name` 预筛在写下的那一刻就与 `guardrails.mjs` 差了四处。而实测全展开 20 万文件只要 0.33 秒——那个「性能问题」根本不存在，真正的成因是单目录 20000 条的硬上限。**先量再优化。**
-- (2026-08-10, R8) **崩溃会释放锁，挂起不会**。原编排器全程无超时，`acquire_lock` 只在持有者进程已死时接管；一个卡死但活着的进程能霸占锁到天亮，且**不产生早报**——正好废掉了 shell 编排器相对 AI 编排器的核心卖点。无人值守系统里，「进程还在」不能当作「工作在推进」，要用心跳判活。
-- (2026-08-10, R8) `set -o pipefail` + `cmd | grep -q` 会因 SIGPIPE 返回 141。MCP 隔离自检里 `! printf | grep -q` 把 141 反转成「检出 MCP」，明明干净却拒绝开工。**shell 里做纯字符串包含判断用 `case`，别用管道。**
-
-- (2026-08-10, R10) **「兜底成一个常量」比不做更糟**。目录摘要里 `shasum ... || printf 'UNREADABLE %s'` 看起来是稳妥的降级，实际把「读不到」变成了一个恒定值——嵌套目录链接下的内容随便改，摘要纹丝不动，而**漏检看起来像已覆盖**。降级路径要么携带真实信息，要么失败关闭。
-- (2026-08-10, R10) **要杀一棵进程树，先确认自己以为的「组」是不是真的**。这里连着错两次：编排器根本不是进程组组长（`pgid != $$`，三种启动方式实测），而 AI 子进程又被 `set -m` 放进了它自己的组——于是「杀父组」既杀不到父，也杀不到子。`ps -o pgid=` 一条命令就能证伪，我却先写完了整套逻辑。
-- (2026-08-10, R10) **最需要一份诚实报告的时刻，正是报告最容易说谎的时刻**。`current-run.json` 在崩溃时最可能被写坏，而早报把 `JSON.parse` 失败 catch 成「找不到运行记录…夜班可能未启动」——一个**编造的原因**。用户会以为什么都没发生，实际任务可能已经实现并 checkpoint 了。降级信息必须区分「没有」与「读不了」，且只说事实、不猜原因。
-- (2026-08-10, R11) **同一个挂起兜底我写错了三次，三次都测试全绿**：R8 写在 launchd 永不触发的地方；R10 打的进程组不存在；R11 跳过的正是要杀的目标（bash 3.2 子 shell 的 `$$` 是父进程 PID，且无 `BASHPID`）。三次的共同点不是逻辑难，是**没有一个测试让看门狗真的开一枪**。补上 `watchdog.test.sh` 之后，R10 的代码立刻挂 3 条。**对「兜底机制」，断言必须落在「它真的动手了吗」，不能落在内部状态。**
-- (2026-08-10, R11) **测试自己也要做正对照**。挂起场景我写错两次（`sleep 600`、`read < fifo`），两次都让带缺陷的旧代码通过——因为父进程是被间接弄死的，不是被看门狗杀死的。写完断言，拿**已知有缺陷的版本**跑一遍，是唯一能证明它有检出能力的办法。
-- (2026-08-10, R11) **修完一处，同类缺陷会在别处复现**。R10 我刚按 Codex 的意见给超时路径加了「先确认进程组还在」，转头就在看门狗路径上写了个不做任何校验的 `kill -TERM -"$wd_pg"`。修缺陷时要问的不是「这里改好了吗」，而是「这一类还有几处」。
-- (2026-08-10, R12) **「先冻住再杀」有个比孤儿更糟的失败模式**：STOP 成功后若杀手在 CONT 前自己死掉，目标就永久停在状态 `T`——不退出、不占 CPU、极难发现。实测复现。解法来自另一条实测事实：**SIGKILL 对 stopped 进程直接生效，不需要先 CONT**。于是后代走 STOP→KILL（窗口根本不存在），根进程不 STOP 只 TERM（它要让 EXIT trap 跑完）。
-- (2026-08-10, R12) **失败时打印 `{ok:false}` 却 `exit 0`，等于把失败伪装成成功**。`cli.mjs` 开头的约定就写着「绝不在失败时打印看起来像成功的 JSON」，我在新加的 `backup-file` 里自己违反了——shell 侧 `if node ...; then n=$((n+1))` 于是把失败计成「已备份 N 份」。**护栏报警时你以为有副本可还原，其实没有。**
-- (2026-08-10, R12) **文档描述了一个不存在的行为，十一轮无人发现**。`decideHop` 的 `defer-review`/`fix-only` 只出现在注释里，主循环从不据此改变行为，而 SKILL.md 的额度中继表把它们写成了既成事实。**「算出来了」不等于「用上了」——枚举返回值时要问：每一个分支在代码里都有对应的动作吗？**
-- (2026-08-10, R12) **测试进程要按「本次运行」打标记**。用固定标记时，上一次运行（尤其是被打断的那次）留下的孤儿会被下一次当成自己的残留，报出与本次无关的失败——我就因此看到过「452 个孤儿」的假失败。
-- (2026-08-10, R13) **「文档说有、代码没有」需要专门去查，不会自己冒出来**。十二轮里我每轮都在查护栏、查进程、查 hook，从没问过「文档承诺的行为，代码里真有对应动作吗」——于是额度中继的两个 action 只活在注释里整整十一轮。这一轮专门做了一次文档 vs 代码符合性扫查，又查出六处不符（含同一份 SKILL.md 里两句话互相矛盾: 一处说「后续触发发现锁被占就退出」，另一处引 `launchd.plist(5)` 说根本不会有后续触发）。**改文档时要回头看旧段落，新写的那段对了不代表旧的那段不再错。**
-- (2026-08-10, R13) **我写来证明修复有效的测试，第三次因错误理由而通过**。这次是额度中继: 第一跳排了 5 分钟退避，紧接着的第二跳在 `retry-due` 就退出了，根本没进 `fix-only` 分支；日志累加又让 grep 被第一跳的消息满足；`CALLED <= 1` 还放行了一次不该有的调用。**三处叠加，任何一处单独看都像是对的。** 修法是逐条堵掉，并拿「拆掉 fix-only 分支」的版本验证它确实会失败。
-- (2026-08-10, R14) **批量编辑脚本中途失败 = 一个字都没写，而中止前打印的每一条 ✓ 都还在屏幕上**。R13 我用一个 python 批处理改五处，其中一处锚点没匹配上触发 `SystemExit`，`write_text` 从未执行——但前面几处的 ✓ 已经打出来了，我又只看 `bash -n` 通过就往下走，于是在 read-back 里白纸黑字写了「已加 `*)` 兜底」，而代码里根本没有。**这是我第二次声称一个没做的修复。改完必须回读文件本身（grep 那个符号），不能信脚本的输出。**
-- (2026-08-10, R14) **同一个修复要问「这类地方有几处」**。R13 我给「codex 失败也要跑 guard_verify」改了两个调用点，漏掉第三个（普通修复轮）——护栏洞在声称修好的那一轮里其实还开着。这轮按 Codex 的建议统一封装成 `codex_step`，三处收口到一处，以后不会再漏。
-- (2026-08-10, R14) **注释也会过期，而且没人测它**。`_kill_tree_sweep` 在 R13 改顺序后已无生产调用者，函数头却还写着「根 fork 竞态由反复 sweep 兜底」——与同一轮新加的「残留窗口未解决」直接矛盾。死代码 + 过期注释一起，会让下一个改这段的人（很可能是我自己）以为有个并不存在的兜底。已删函数、改注释。
-- (2026-08-10, R15) **修一个洞时会在同一个函数里开另一个**。R14 我为了不吞掉恢复证据的写盘失败，在 `codex_step` 里加了一句 `return 2`——恰好排在 `guard_verify` 前面，于是「codex 改了受保护文件 + 写盘恰好失败」时护栏被整个跳过。Codex 实测复现了。**顺序原则要写下来: 只要 codex 跑过，无论后续怎么处置，护栏都必须先跑完。**
-- (2026-08-10, R15) **「没有测试覆盖的地方，审查也不会自己走到那里」**。`lib/queue.mjs` 里有一段被误粘贴进循环内部的重复代码——语法合法、功能冗余但正确，所以 55 项单测和 14 轮审查全都没碰到它。同一个文件里还有两处静默失效（`priority` 写错变 NaN 使排序不可预测、`id` 直接拼进文件路径可越出 logs 目录）。它解析的是**用户手写的 Markdown**，是最该校验输入的地方，却是最后才被看的地方。**点名去审一个模块，和「审查了这个仓库」是两回事。**
-- (2026-08-11, R16) **关键词匹配不是断言**。我为「护栏可以被整个删掉而全绿」专门加了失败注入，判据却是「日志里出现『护栏』二字」——Codex 把 `guard_verify` 换成「只打一行含『护栏』的日志然后返回成功」，30 条照样全过。我上一轮验检出能力时，crippled 版把日志也一起去掉了，所以没暴露。**验证 crippled 版时要挑最刁的那种打残方式，不是最方便的那种。** 现在断言落在确切违规原因 + 收工原因 + TERMINATED 落盘 + 未产生 checkpoint 四项上。
-- (2026-08-11, R16) **收紧输入校验时要先问「现存数据会不会被拒绝」**。我为了防路径越界，把任务 id 限定成 `A-Za-z0-9._-`——而 `queue.md` 是与 Claude 侧共享、由用户手写的文件，中文 id 完全正常。一次升级就会让整队拒绝解析 → `init` 失败 → 落 TERMINATED + 卸载 launchd，**静默停掉一套本来正常的安装**。正解是保留 id 原样、只对派生文件名编码。**破坏性变更要按「现有用户的数据」来检验，不是按「什么最安全」。**
-- (2026-08-11, R16) **「测了的不用，用了的没测」是一类独立的缺陷**。`state.nextTask`/`nextPending`/`findings.readFindings` 加起来有 7 条单测、**零生产调用**；而真正在跑的任务选择器（含同仓库串行）一条单测都没有。「59 项单测通过」于是让人以为任务选择被覆盖了。删死代码只是顺手，关键是**把生产实现搬到被测的位置**，让测的那份就是跑的那份。
-- (2026-08-11, R17) **「加了失败注入」不等于「护栏被覆盖」**。我为护栏加了失败注入，只覆盖了五项核验里的**一项**（受保护路径哈希）；Codex 把 `rev-list`、merge 标记、分支切换、`for-each-ref` 四项**全部删掉**，149 项照样全绿。现在五项各有独立注入，每条声明「动作 → 期望看到的那一句」。**验证 crippled 版时也要小心: 我第一次粗暴删行造成语法错误，那次「20 条失败」其实什么也没证明。**
-- (2026-08-11, R17) **同一个判据我写错了两次，两次都是「看起来管了、实际没管」**。R15 限定 id 字符集（过度纠正，会拒掉既有中文 id）；R16 改成 `id.split(/[^A-Za-z0-9]/).includes("..")`——**永远为 false**，而 SKILL.md 还写着「拒绝所有含 `..` 的 id」。正解是把**显示 id 与文件名彻底分离**: id 只拒绝无法如实往返的字符（路径分隔符、控制字符），路径安全全部交给派生端的 `safe_id`。**让一个字段同时承担「给人看」和「当文件名」两件事，是这两次错误的共同根源。**
-- (2026-08-11, R18) **子串匹配的「保护」会变成「误伤」**。`PROTECTED_PATH` 裸匹配 `nda`/`legal`，于是 `standard/`、`illegal/`、`agenda/` 整棵子树都被判为受保护——`standard/` 是极常见的目录名，那个仓库里**每一次正常改动都会被判成受保护路径变化并中止整夜**。护栏的误报和漏报一样致命：漏报让你以为安全，误报让你根本用不了。改为要求关键词占据完整路径片段（CJK 无词边界，保留子串匹配）。
-- (2026-08-11, R18) **豁免规则比保护规则更需要锚定**。`CREDENTIAL_EXEMPT` 里前四条有 `$`、后三条没有，于是任何**包含** `.env.example` 的路径都整个跳过凭据判定——`.env.example.real` 不受保护。**一条豁免的作用域写宽了，等于把它覆盖的所有保护一起关掉。**
-- (2026-08-11, R18) **「核验命令失败」与「未检出违规」必须是两条路**。`for-each-ref` 的退出码被忽略，失败时输出为空；若快照也为空（detached HEAD 无分支）两者相等 → 放行。失败关闭契约的前提是**先能区分「没查出问题」和「没查成」**。已加两条「核验命令自身失败」的注入（PATH 包装 git，快照后置 marker 才让它失败）。
-- (2026-08-11, R19) **护栏边界两个方向各错一次，说明它需要双向断言**。R18 之前裸子串 → `standard/` 被误判为受保护，那个仓库每次改动都中止整夜；R18 之后两端都要分隔符 → `NDA2026.pdf`、`contractual-obligations.pdf` 漏检。观察到规律后规则改成**不对称**的：误报全来自关键词**前面**接字母，漏报全来自要求**后面**有分隔符。测试现在两个方向各断言一组（24 条）。
-- (2026-08-11, R19) **我引用了一个只测了一半的性能数字，还写进了文档**。「20 万文件 0.33 秒」是在一个**受保护文件数为 0** 的仓库上测的——`protected-in` 返回空列表，最贵的哈希步骤根本没跑。真实场景（1 万个受保护文件）是 **128 秒**，因为 R10 我为「避免 xargs 分批影响结果」改成了逐个 `shasum`，每文件一次进程创建，**而那次改动的代价我没测**。改回批量 + `sort`（分批的顺序问题 sort 就解决了）后 **3.5 秒**，输出逐字节一致。**优化和反优化都要在有代表性的数据上测——0 个受保护文件的仓库测不出哈希成本。**
-- (2026-08-16, R20) **自洽的校验不等于正确的校验**。批量哈希的条数校验是「文件里有几条」对「哈希出几条」——两个数都源自**同一个可能被截断的文件**，所以磁盘满/只读时它们完美相符，而实际一条都没查。必须把计数锚在**独立的、打算写入的条数**上。Codex 报的是我新写的 `plain`，我复现时发现 `exp` 上有同一缺陷、且**从 R8 起就在**——实测「退出码 0、stdout 零字节」（正常 185 字节）。四个临时文件现在任一不可写都失败关闭。
-- (2026-08-16, R20) **同一条边界规则改了四版，每版都被打出反例**。裸子串→误报；两端要分隔符→漏报；统一词尾白名单→`NDAv2` 仍漏而 `legality/` 误报。第四版按**关键词分别列后缀**：`legal` 是常见英文词根故后面必须是边界，`nda`/`contract`/`agreement` 很少作别的词的前缀故可带版本状态后缀。**规则要按每个关键词的语言学性质分别定，而不是找一条统一公式。**
-- (2026-08-16, R20) **「中文无词边界」不是保留裸子串的理由，恰恰是反对它的理由**。我 R19 写的理由是「中文里不存在 standard 那样的误命中词」——`组<合同>步器`、`符<合同>一标准`、`联<合同>步测试`、`方<法律>定` 全是。无词边界让歧义更严重，不是更轻。
-- (2026-08-16, 实机) **二十轮代码审查抓不到「这台机器上跑不起来」**。装上 launchd 后它整夜每 5 分钟试一次、一个任务都没做，日志清一色「MCP 隔离自检执行失败 / MCP 未能清空」——而真实原因是 `codex` 根本不在 launchd 的 PATH 里（127 command not found）。**那条错误信息把人指向了完全错误的方向，代价是一整夜。** 两个教训: (a) 「登录 shell 保证 PATH 里有 X」这种假设必须在**目标执行环境**里实测，不能写在注释里就算数; (b) 失败诊断要分清「命令没跑起来」和「命令跑了但结果不对」——把两者折叠成一条消息，等于让日志说谎。
-- (2026-08-16, 实机) **兜底 PATH 要追加不要前置**。第一版我前置了 `~/.local/bin`，直接把 e2e 的影子二进制顶掉——对真实用户就是「我明明指定了那个 codex，它却用了别的」。兜底只应在缺失时生效。
+本技能以 MIT License 发布；许可证全文见本技能目录内的 `LICENSE`。

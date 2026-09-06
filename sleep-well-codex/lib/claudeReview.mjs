@@ -2,36 +2,14 @@
 //
 // 反向对照物: ~/.claude/skills/sleep-well/lib/codexReview.mjs（那边是 Claude 产出 → codex 审）。
 //
-// 与 codexReview 的关键差异（也是本技能相对 sleep-well 的实质改进）:
-//   codex exec review 输出散文体，没有可靠的结构化 findings[]，sleep-well 的 SKILL.md 因此
-//   要求「YOU read agentText, extract each distinct issue」——让模型去数条数。那正是
-//   codex-handoff 2026-07-23 事故的根源（实际 24 条，只处置了 preview 里可见的 18 条）。
-//   claude-handoff 出结构化 findings，元信息头直接写「findings 条数: N」，此处机读，不经模型。
+// 与 codexReview 的关键差异:
+//   该适配器输出结构化 findings 和机读计数；本模块不让模型重新估算条数。
 //
 // 失败关闭契约（继承自 claude-handoff）:
-//   findings 文件存在 ⟺ 该轮审查完整可信。文件不存在时**绝不**当作「零 findings 通过」。
+//   findings 文件存在且适配器退出码为 0，才可能表示该轮审查完整可信。
+//   文件不存在或退出码非零时**绝不**当作「零 findings 通过」。
 
-import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
-
-const SCRIPT =
-  process.env.SLEEP_WELL_CLAUDE_REVIEW ||
-  `${process.env.HOME}/.codex/skills/claude-handoff/scripts/claude-code-review.sh`;
-
-export function buildReviewArgs({ repo, scope = "uncommitted", base, template = "decision" }) {
-  const args = ["-C", repo];
-  if (scope === "base") {
-    if (!base) throw new Error("scope=base requires base");
-    args.push("--base", base);
-  } else if (scope === "commit") {
-    if (!base) throw new Error("scope=commit requires base (the sha)");
-    args.push("--commit", base);
-  } else {
-    args.push("--uncommitted");
-  }
-  if (template) args.push("-t", template);
-  return args;
-}
 
 // 解析 claude-handoff 的 stdout/stderr。纯函数，可单测。
 // 返回 { ok, findingsFile, count, high, unavailable, reason }
@@ -55,6 +33,18 @@ export function parseReviewOutput(stdout = "", stderr = "", code = 0) {
     };
   }
   const findingsFile = fm[1].trim();
+
+  // A file published before an adapter crash is diagnostic material, not a
+  // completed review. Preserve its path in the result but reject every nonzero
+  // exit before reading or trusting its contents.
+  if (code !== 0) {
+    return {
+      ok: false,
+      unavailable: null,
+      findingsFile,
+      reason: `适配器以退出码 ${code} 结束——不完整审查不得视为可信结果`,
+    };
+  }
 
   // claude-handoff 的契约是「findings **文件**存在 ⟺ 该轮完整可信」。stdout 只是回显——
   // 文件发布失败/被删/不可读时若退回读 stdout，一个「0 条」摘要就能让任务直接通过，
@@ -117,7 +107,6 @@ export function extractFindings(findingsFileText) {
 // claude-handoff 由脚本预生成骨架，两者本应恒等；不等说明文件被改坏或被截断。
 export function verifyFindingsIntegrity(findingsFileText, declaredCount) {
   const skeleton = (String(findingsFileText).match(/^-\s*\[ \]\s*#\d+/gm) || []).length;
-  if (declaredCount === 0) return { ok: true, skeleton: 0 };
   return {
     ok: skeleton === declaredCount,
     skeleton,
@@ -126,24 +115,4 @@ export function verifyFindingsIntegrity(findingsFileText, declaredCount) {
         ? ""
         : `处理状态骨架 ${skeleton} 条 ≠ 声明的 ${declaredCount} 条，findings 文件可疑`,
   };
-}
-
-// 实跑。集成路径，不做单测。
-export function runReview({ repo, scope = "uncommitted", base, template = "decision" }) {
-  const args = buildReviewArgs({ repo, scope, base, template });
-  let stdout = "";
-  let stderr = "";
-  let code = 0;
-  try {
-    stdout = execFileSync(SCRIPT, args, {
-      encoding: "utf-8",
-      maxBuffer: 32 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (e) {
-    code = typeof e.status === "number" ? e.status : 1;
-    stdout = e.stdout ? String(e.stdout) : "";
-    stderr = e.stderr ? String(e.stderr) : String(e.message || "");
-  }
-  return parseReviewOutput(stdout, stderr, code);
 }

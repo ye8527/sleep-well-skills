@@ -16,6 +16,7 @@
 # 成变量名 `n（` 而 set -u 立即退出（claude-handoff 项目实测三种 locale 全复现）。
 
 set -uo pipefail
+umask 077
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SELF_DIR/.." && pwd)"
@@ -23,32 +24,44 @@ CLI="$SKILL_DIR/lib/cli.mjs"
 REVIEW_SH="${SLEEP_WELL_CLAUDE_REVIEW:-$HOME/.codex/skills/claude-handoff/scripts/claude-code-review.sh}"
 
 ROOT="${SLEEP_WELL_ROOT:-$HOME/sleep-well}"
-CODEX_HOME="$ROOT/codex"
-CODEX_HOME_OVERRIDE=""
-STATE_DIR="$CODEX_HOME/state"
-LOG_DIR="$CODEX_HOME/logs"
+case "$ROOT" in
+  /*) ;;
+  *) printf 'SLEEP_WELL_ROOT 必须是绝对路径\n' >&2; exit 1 ;;
+esac
+mkdir -p "$ROOT" || exit 1
+ROOT="$(cd "$ROOT" 2>/dev/null && pwd -P)" || exit 1
+SW_ACCOUNT_HOME="$(cd "$HOME" 2>/dev/null && pwd -P)" || exit 1
+case "$ROOT" in
+  /|"$SW_ACCOUNT_HOME")
+    printf 'SLEEP_WELL_ROOT 不得是 / 或账户 HOME\n' >&2
+    exit 1 ;;
+esac
+# Preserve the caller's real Codex configuration root before defining this
+# skill's private runtime tree. A custom CODEX_HOME may hold the only valid
+# login state and must not be overwritten by an internal variable.
+SW_USER_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+SW_RUNTIME_HOME="$ROOT/codex"
+STATE_DIR="$SW_RUNTIME_HOME/state"
+LOG_DIR="$SW_RUNTIME_HOME/logs"
 LOCK="$ROOT/NIGHT.lock"
 STOP_FILE="$ROOT/STOP"
 HEARTBEAT="$STATE_DIR/heartbeat"
-CONFIG="$CODEX_HOME/config.json"
+CONFIG="$SW_RUNTIME_HOME/config.json"
 CODEX_BIN="${SLEEP_WELL_CODEX:-codex}"
 PLIST_LABEL="com.user.sleepwell-codex"
 # 心跳停滞多久算「持有者挂了」。必须大于单次 AI 调用超时，否则正常的长调用会被误判接管。
 HANG_LIMIT_SECS="${SLEEP_WELL_HANG_LIMIT:-2700}"
-# 看门狗轮询间隔与终止宽限期。参数化是为了**能被测试**——连续三轮的看门狗缺陷
-# （R8 死代码 / R10 打错进程组 / R11 跳过编排器自己）没有一条被测试抓住，
-# 根因就是没有一个测试真的让看门狗去杀一个卡死的编排器。
+# 看门狗轮询间隔与终止宽限期可覆写，以便做真实的进程终止回归测试。
 WATCHDOG_POLL_SECS="${SLEEP_WELL_WATCHDOG_POLL:-30}"
 WATCHDOG_GRACE_SECS="${SLEEP_WELL_WATCHDOG_GRACE:-30}"
+# Commands that must run before the in-process watchdog can be armed (notably
+# lock-owner ps probes and TERMINATED recovery) get their own short process-
+# group timeout. This prevents a broken system shim from swallowing every
+# later launchd interval before NIGHT.lock or a heartbeat exists.
+STARTUP_TIMEOUT_SECS="${SLEEP_WELL_STARTUP_TIMEOUT:-15}"
 
-# ⚠️ launchd 下的 PATH 不能指望登录 shell（2026-08-16 实测: 这台机器上 `/bin/bash -lc`
-#    的 PATH 里**没有** codex 也没有 claude——它们在 ~/.local/bin，而那个目录是交互式
-#    rc 文件加的）。plist 的注释曾写着「-lc 走登录 shell，保证 PATH 里有 codex/claude/node」，
-#    那个假设是假的: 真实后果是 `codex mcp list` 返回 127，整夜每 5 分钟一次「拒绝开工」。
-#    这里显式补上常见位置，nvm 的当前版本也补上。
-# ⚠️ **追加**而不是前置: 前置会盖过调用方 PATH 里的选择（实测直接把 e2e 的影子
-#    二进制顶掉了；对真实用户就是「我明明指定了那个 codex，它却用了别的」）。
-#    这些只是**缺失时的兜底**，既有 PATH 永远优先。
+# launchd 的非交互环境不保证包含用户在 shell rc 中添加的目录。
+# 常见安装位置只在现有 PATH 后追加，确保调用方显式选择的二进制仍然优先。
 for _d in "$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin; do
   [ -d "$_d" ] && PATH="$PATH:$_d"
 done
@@ -58,8 +71,74 @@ fi
 export PATH
 
 mkdir -p "$LOG_DIR" "$STATE_DIR" || exit 1
+chmod 700 "$ROOT" "$SW_RUNTIME_HOME" "$LOG_DIR" "$STATE_DIR" || exit 1
+[ ! -e "$CONFIG" ] || chmod 600 "$CONFIG" || exit 1
 RUNLOG="$LOG_DIR/orchestrator-$(date '+%Y-%m-%d').log"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$RUNLOG"; }
+
+# Shell arithmetic treats a leading zero as octal, while `test` compares these
+# configuration strings as decimal. Normalize digits without arithmetic before
+# any value is consumed by `$(( ... ))`, so values such as 08 cannot pass the
+# range gate and then abort the process at the first calculation.
+normalize_decimal() { # $1=unsigned decimal; prints canonical decimal
+  local value="$1"
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+    value="${value#0}"
+  done
+  printf '%s' "$value"
+}
+
+if STARTUP_TIMEOUT_SECS="$(normalize_decimal "$STARTUP_TIMEOUT_SECS")"; then
+  # Anything wider than the documented maximum is clamped without asking the
+  # shell to parse an integer that may exceed its native range.
+  [ "${#STARTUP_TIMEOUT_SECS}" -le 3 ] || STARTUP_TIMEOUT_SECS=300
+else
+  log "⚠️ SLEEP_WELL_STARTUP_TIMEOUT 非法，回落 15"
+  STARTUP_TIMEOUT_SECS=15
+fi
+[ "$STARTUP_TIMEOUT_SECS" -lt 3 ] && STARTUP_TIMEOUT_SECS=3
+[ "$STARTUP_TIMEOUT_SECS" -gt 300 ] && STARTUP_TIMEOUT_SECS=300
+
+# Bound one startup/recovery command in its own process group. The regular
+# watchdog is intentionally armed only after this process owns NIGHT.lock;
+# this helper closes the smaller pre-lock window without creating competing
+# watchdogs that share one heartbeat file.
+run_startup_bounded() { # $1=diagnostic label, remaining args=command/function
+  local label="$1" prev_m pid polls=0 max_polls rc
+  shift
+  max_polls=$((STARTUP_TIMEOUT_SECS * 10))
+  case "$-" in *m*) prev_m=yes ;; *) prev_m=no ;; esac
+  set -m
+  ( "$@" ) &
+  pid=$!
+  [ "$prev_m" = no ] && set +m
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$polls" -ge "$max_polls" ]; then
+      log "⚠️ 启动阶段命令超时（${STARTUP_TIMEOUT_SECS}s）: ${label}"
+      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 0.1
+    polls=$((polls + 1))
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  return "$rc"
+}
+
+bounded_capture() { # $1=diagnostic label, remaining args=command
+  local label="$1" out rc value
+  shift
+  out="$(mktemp "${STATE_DIR}/startup-capture.XXXXXX")" || return 1
+  run_startup_bounded "$label" "$@" >"$out" 2>>"$RUNLOG"; rc=$?
+  value="$(<"$out")"
+  rm -f "$out" 2>/dev/null
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$value"
+}
 
 # jq_get: 取 JSON 字段。**区分「解析失败」与「字段为空」**（Codex R1 #15）——
 # 原实现把两者都折叠成空串，于是状态损坏导致 next-task 失败时，空 task.id 会被
@@ -105,8 +184,50 @@ cli_json() {
 
 # ── 推送（ntfy.sh）────────────────────────────────────────────────────
 NTFY_TOPIC=""
-if [ -f "$CONFIG" ]; then NTFY_TOPIC="$(jq_get "$(cat "$CONFIG")" ntfy_topic || true)"; fi
+read_ntfy_topic_without_node() {
+  # This runs before NIGHT.lock and the main watchdog exist, so use Bash's
+  # builtin file read and parameter expansion only—no node/sed/head process is
+  # allowed here. Capture the complete JSON string; push() later validates the
+  # exact value and rejects escapes, dots, slashes, or other unsafe characters.
+  local raw rest topic
+  raw="$(<"$1")" 2>/dev/null || return 1
+  case "$raw" in *'"ntfy_topic"'*) rest="${raw#*\"ntfy_topic\"}" ;; *) return 1 ;; esac
+  case "$rest" in *:*) rest="${rest#*:}" ;; *) return 1 ;; esac
+  case "$rest" in *\"*) rest="${rest#*\"}" ;; *) return 1 ;; esac
+  topic="${rest%%\"*}"
+  [ -n "$topic" ] || return 1
+  printf '%s' "$topic"
+}
+if [ -f "$CONFIG" ]; then
+  NTFY_TOPIC="$(read_ntfy_topic_without_node "$CONFIG" 2>/dev/null || true)"
+fi
+redact_push_text() {
+  local s="$1"
+  # ntfy topics are publicly subscribable. Never expose the account's home path.
+  if [ -n "${HOME:-}" ]; then s="${s//${HOME}/\~}"; fi
+  # Keep user-controlled text literal even if a future curl call regresses from --data-raw.
+  case "$s" in @*|-*) s=" $s" ;; esac
+  printf '%s' "$s"
+}
+truncate_push_text() {
+  local limit="$1" input cleaned bytes
+  input="$(cat)" || return 1
+  # Filter C0/C1 controls before slicing so a queue title cannot become an
+  # injected HTTP header. Array.from slices Unicode code points and therefore
+  # never emits half of a UTF-8 character as printf '%.Ns' can.
+  if command -v node >/dev/null 2>&1; then
+    printf '%s' "$input" | node -e 'let s=""; const n=Number(process.argv[1]); process.stdin.setEncoding("utf8"); process.stdin.on("data", d => { s += d; }); process.stdin.on("end", () => { process.stdout.write(Array.from(s).filter(c => !/\p{Cc}/u.test(c)).slice(0, n).join("")); });' "$limit" \
+      && return 0
+  fi
+  # node may be the missing/broken dependency we are trying to report. Keep a
+  # conservative byte-bounded fallback for the fixed short failure alerts.
+  cleaned="$(printf '%s' "$input" | LC_ALL=C tr -d '\001-\037\177')" || return 1
+  bytes="$(printf '%s' "$cleaned" | LC_ALL=C wc -c | tr -d ' ')" || return 1
+  [ "$bytes" -le "$limit" ] || return 1
+  printf '%s' "$cleaned"
+}
 push() {
+  local safe_title safe_body
   log "PUSH[$1] $2"
   [ -z "$NTFY_TOPIC" ] && return 0
   # topic 未校验就拼进 URL 会静默改变端点（`a/../../evil`、`a?priority=5`）——
@@ -114,28 +235,126 @@ push() {
   case "$NTFY_TOPIC" in
     *[!A-Za-z0-9_-]*|'') log "⚠️ ntfy_topic 含非法字符（只允许 A-Za-z0-9_-），本次不推送"; return 0 ;;
   esac
-  # 只推任务标题与状态——绝不推代码片段、路径、findings 正文（ntfy 是公开服务）
-  # spec 写明「每条 ≤200 字符」，但代码里一直没有截断（R13 符合性扫查）。
-  # 任务标题来自 queue.md，长标题会让推送正文远超这个上限。
-  curl -fsS --max-time 10 -H "Title: $(printf '%.60s' "$1")" -d "$(printf '%.200s' "$2")" \
+  # 只推任务标题与状态——绝不推代码片段、路径、findings 正文（ntfy 是公开服务）。
+  # 固定调用点不应传路径；这里再把 $HOME 替换成 ~ 作为纵深防御。
+  safe_title="$(redact_push_text "$1")"
+  safe_body="$(redact_push_text "$2")"
+  # 任务标题来自 queue.md；按 Unicode code point 截断，既守住字符上限，也不
+  # 会像 bash printf 的字节精度那样把中文截成非法 UTF-8。
+  safe_title="$(printf '%s' "$safe_title" | truncate_push_text 60)" \
+    || { log "PUSH 标题截断失败（已忽略）"; return 0; }
+  safe_body="$(printf '%s' "$safe_body" | truncate_push_text 200)" \
+    || { log "PUSH 正文截断失败（已忽略）"; return 0; }
+  curl -fsS --max-time 10 -H "Title: $safe_title" --data-raw "$safe_body" \
     "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1 \
     || log "PUSH 失败（已忽略）"
 }
 
+# Persist notification attempts across launchd retries.  The marker is a
+# directory because mkdir is atomic even when two manual invocations race.
+# A failed archive deliberately leaves the run active for retry; without this
+# gate the same morning summary and archive alarm would be published every five
+# minutes until the underlying disk/permission fault is repaired.
+push_once() {
+  local key="$1"; shift
+  local marker="$STATE_DIR/.push-once-${key}"
+  local fallback_marker="$SW_RUNTIME_HOME/.push-once-fallback-${key}"
+  if [ -d "$marker" ] || [ -d "$fallback_marker" ]; then
+    log "PUSH_ONCE[${key}] 已尝试，跳过重复通知"
+    return 0
+  fi
+  if mkdir "$marker" 2>/dev/null; then
+    push "$@"
+  elif [ -d "$marker" ] || [ -d "$fallback_marker" ]; then
+    # Another invocation won the atomic mkdir race.
+    log "PUSH_ONCE[${key}] 已尝试，跳过重复通知"
+  elif mkdir "$fallback_marker" 2>/dev/null; then
+    # A corrupt or read-only state directory must not silence the only useful
+    # failure alert. The runtime-root marker still deduplicates later ticks.
+    log "PUSH_ONCE[${key}] 状态标记不可写，使用运行根备用标记"
+    push "$@"
+  elif [ -d "$fallback_marker" ]; then
+    log "PUSH_ONCE[${key}] 已尝试，跳过重复通知"
+  else
+    # If neither durable location is writable, silence is worse than a repeat.
+    log "⚠️ PUSH_ONCE[${key}] 无法持久化去重标记，降级直接通知"
+    push "$@"
+  fi
+}
+clear_push_once() {
+  rmdir "$STATE_DIR/.push-once-$1" 2>/dev/null || true
+  rmdir "$SW_RUNTIME_HOME/.push-once-fallback-$1" 2>/dev/null || true
+}
+
 # ── 锁 ────────────────────────────────────────────────────────────────
 HAVE_LOCK=no
-_write_owner() { printf '%s\n%s\n' "$$" "$(ps -o lstart= -p $$ 2>/dev/null | tr -s ' ')" >"$LOCK/owner"; }
-acquire_lock() {
-  if mkdir "$LOCK" 2>/dev/null; then
-    _write_owner; HAVE_LOCK=yes; return 0
+normalize_ps_start() {
+  local raw="$1" dow mon day clock year extra
+  read -r dow mon day clock year extra <<EOF
+$raw
+EOF
+  [ -n "$dow" ] && [ -n "$mon" ] && [ -n "$day" ] \
+    && [ -n "$clock" ] && [ -n "$year" ] && [ -z "$extra" ] || return 1
+  printf '%s %s %s %s %s' "$dow" "$mon" "$day" "$clock" "$year"
+}
+_write_owner() {
+  local started raw_started
+  raw_started="$(bounded_capture "读取当前进程启动时间" ps -o lstart= -p $$)" || return 1
+  started="$(normalize_ps_start "$raw_started")" || return 1
+  [ -n "$started" ] || return 1
+  printf '%s\n%s\n' "$$" "$started" >"$1"
+}
+_publish_lock() {
+  # Write a complete owner record first, then publish it with one atomic hard
+  # link. The previous mkdir-then-write sequence exposed a missing-owner window
+  # in which a competitor could misclassify a brand-new lock as stale.
+  local candidate
+  candidate="$(mktemp "${LOCK}.owner.XXXXXX")" || return 1
+  if ! _write_owner "$candidate"; then rm -f "$candidate"; return 1; fi
+  # Use link(1), not ln(1): BSD `ln source existing-directory` succeeds by
+  # creating `existing-directory/<basename>` and would falsely report that a
+  # legacy directory lock had been acquired. link's target is always exact.
+  if link "$candidate" "$LOCK" 2>/dev/null; then
+    rm -f "$candidate"
+    HAVE_LOCK=yes
+    return 0
   fi
-  local pid started
-  pid="$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
-  started="$(sed -n 2p "$LOCK/owner" 2>/dev/null)"
+  rm -f "$candidate"
+  return 1
+}
+_lock_owner_path() {
+  # Read legacy directory locks as well so upgrades do not steal a live lock.
+  if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then printf '%s\n' "$LOCK/owner"; else printf '%s\n' "$LOCK"; fi
+}
+_remove_lock_artifact() {
+  if [ -d "$1" ] && [ ! -L "$1" ]; then rm -rf "$1"; else rm -f "$1"; fi
+}
+acquire_lock() {
+  _publish_lock && { clear_push_once lock-anomaly; return 0; }
+  local pid started raw_owner_started owner
+  owner="$(_lock_owner_path)"
+  pid="$(sed -n 1p "$owner" 2>/dev/null)"
+  raw_owner_started="$(sed -n 2p "$owner" 2>/dev/null)"
+  started="$(normalize_ps_start "$raw_owner_started" 2>/dev/null || true)"
+  # A missing owner field means the live/stale distinction is unavailable. Do
+  # not steal a possibly-live lock; fail closed and leave it for diagnosis.
+  if [ -z "$pid" ] || [ -z "$started" ]; then
+    log "锁 owner 记录不完整，无法可靠判断是否陈旧，本跳退出"
+    return 2
+  fi
   # PID 会被复用（重启后尤其常见）——只判 kill -0 会把无关的长寿进程当成锁持有者，
   # 于是每次启动都退出、永远不开工且无告警（Codex R4 #15）。加进程启动时间比对。
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-     && [ "$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')" = "$started" ]; then
+  local current_started=""
+  if kill -0 "$pid" 2>/dev/null; then
+    local raw_current_started
+    raw_current_started="$(bounded_capture "读取锁持有者启动时间" ps -o lstart= -p "$pid")" \
+      || { log "无法读取锁持有者启动时间，本跳退出"; return 2; }
+    current_started="$(normalize_ps_start "$raw_current_started")" \
+      || { log "锁持有者启动时间格式异常，本跳退出"; return 2; }
+    [ -n "$current_started" ] \
+      || { log "锁持有者启动时间为空，本跳退出"; return 2; }
+  fi
+  if [ -n "$current_started" ] && [ "$current_started" = "$started" ]; then
     # 持有者活着就退出本跳。**不在这里做挂起接管**（Codex R9 #1）:
     # launchd.plist(5) 原文——「If the job is running during an interval firing,
     # that interval firing will likewise be missed.」持有者挂起时 launchd 根本不会
@@ -147,15 +366,25 @@ acquire_lock() {
   # 用 mv 把陈旧锁改名——rename 是原子的，只有一个进程能成功——再正常 mkdir 抢。
   local stale="${LOCK}.stale.$$.$(date +%s)"
   if mv "$LOCK" "$stale" 2>/dev/null; then
-    rm -rf "$stale"
+    _remove_lock_artifact "$stale"
     log "已移除陈旧锁（原持有者 pid ${pid:-未知} 不存在）"
-    if mkdir "$LOCK" 2>/dev/null; then
-      _write_owner; HAVE_LOCK=yes; return 0
-    fi
+    _publish_lock && return 0
   fi
   log "陈旧锁接管竞争失败，本跳退出"; return 1
 }
-release_lock() { [ "$HAVE_LOCK" = yes ] && rm -rf "$LOCK"; }
+release_lock() { [ "$HAVE_LOCK" = yes ] && _remove_lock_artifact "$LOCK"; }
+
+# Relinquish every runtime ownership artifact before asking launchd to unload
+# this job. `launchctl unload` may terminate the running instance, so cleanup
+# cannot be deferred exclusively to an EXIT trap.
+release_runtime_ownership() {
+  stop_watchdog
+  if [ "$HAVE_LOCK" = yes ]; then
+    rm -f "$ACTIVE_PGID_FILE" 2>/dev/null
+    release_lock
+    HAVE_LOCK=no
+  fi
+}
 
 # ── 进程内看门狗（Codex R9 #1）────────────────────────────────────────
 #
@@ -200,7 +429,8 @@ ACTIVE_PGID_FILE="$STATE_DIR/active-pgid"
 #    而 TERM 发给 stopped 进程会一直挂起。代价是根进程在收到 TERM 前还能再 fork 一次，
 #    那个孩子会在根退出后被 reparent 而逃出后续遍历——**这是已知残留，没有解决**
 #    （Codex R14 #9: 本注释原先声称由 `_kill_tree_sweep` 反复清扫兜底，
-#     但 R13 改了顺序之后 sweep 已无生产调用者，那句话与实际行为矛盾）。
+#     但 R13 改了顺序之后 sweep 已无生产调用者；对外边界见 SKILL.md 已知限制
+#     「看门狗终止挂起编排器时的根进程再次 fork 窗口」）。
 _kill_descendants() {
   local p="$1" skip="${2:-}" c
   for c in $(pgrep -P "$p" 2>/dev/null); do
@@ -211,15 +441,6 @@ _kill_descendants() {
   done
   return 0
 }
-_kill_tree() {
-  local p="$1" sig="$2" skip="${3:-}"
-  [ -n "$p" ] || return 0
-  [ "$p" = "$skip" ] && return 0
-  _kill_descendants "$p" "$skip"
-  kill -"$sig" "$p" 2>/dev/null
-  return 0
-}
-
 # （`_kill_tree_sweep` 已删除: R13 改顺序后它没有生产调用者了，留着会暗示一个
 #   并不存在的兜底机制——根 fork 残留窗口是真实存在且未解决的，见上。）
 
@@ -289,7 +510,8 @@ start_watchdog() {
       #    后续 `pgrep -P` 再也找不到它们（Codex R13 #3）。
       #    ⚠️ 仍有残留窗口: 根在收到 TERM 之前还能再 fork 一次，那个孩子会逃掉。
       #    根不能 STOP（TERM 发给 stopped 进程会一直挂起，EXIT trap 就跑不成），
-      #    所以这一条是**已知残留**，写进 SKILL.md 而不是假装解决了。
+      #    所以这一条是**已知残留**，明确写在 SKILL.md 已知限制
+      #    「看门狗终止挂起编排器时的根进程再次 fork 窗口」。
       _kill_descendants "$ppid" "$wd_self"
       kill -TERM "$ppid" 2>/dev/null
       sleep "$WATCHDOG_GRACE_SECS"
@@ -300,7 +522,7 @@ start_watchdog() {
   WATCHDOG_PID=$!
   # ⚠️ disown: set -m 打开了作业控制，之后 kill 这个后台作业时 bash 会把**整个函数体**
   #    作为「Terminated: 15 ...」打进 stderr——每次正常收工都刷一屏，
-  #    而 launchd 把 stderr 写进 /tmp/sleepwell-codex.err。刚修完误导性诊断，
+  #    而 launchd wrapper 把 stderr 写进 ~/Library/Logs/sleep-well/codex.err。刚修完误导性诊断，
   #    不能又用噪音把真正的错误淹掉。
   disown "$WATCHDOG_PID" 2>/dev/null || true
   [ "$prev_m" = no ] && set +m
@@ -327,9 +549,23 @@ beat() {
 # **一声不吭**，用户早上既没有早报也没有告警，只能自己去翻日志。
 hop_fail() {
   log "⚠️ 本跳异常退出: $1"
-  push "⚠️ 夜班异常退出" "$1"
+  # Internal state/CLI failures are not transient AI availability failures.
+  # Stop once and self-unload so launchd cannot publish the same alert every
+  # five minutes all night. finish_without_run preserves/archives active state.
+  finish_without_run "内部错误" "$1" "⚠️ 夜班异常退出" 1 \
+    "内部错误；$1；详情见本机日志"
+}
+
+# A planned launchd hand-off may leave implementing/reviewing/fixing state on
+# disk. Publish run-bound proof only at the guarded exit boundary; a crash or
+# SIGKILL cannot write it, so the next process will quarantine instead.
+graceful_hop_exit() {
+  local why="${1:-计划内跳退出}"
+  cli_json graceful-hop-exit "$why" >/dev/null \
+    || hop_fail "计划内跳退出标记写入失败"
+  log "计划内跳退出: ${why}"
   FINISHED=yes
-  exit 1
+  exit 0
 }
 
 FINISHED=no
@@ -342,21 +578,44 @@ on_exit() {
   # hook 必须在 EXIT trap 里也恢复（Codex R3 #7）: 进程被 kill / 崩溃时
   # _process_task_inner 的包装层根本执行不到，用户的 pre-push 会被永久留下我们的版本。
   guard_uninstall 2>/dev/null || true
-  stop_watchdog
-  rm -f "$ACTIVE_PGID_FILE" 2>/dev/null
-  release_lock
+  # Only the lock holder owns the shared active-pgid ledger. A competing
+  # launchd/manual invocation exits through this trap too and must not erase
+  # the live holder's graceful AI-process-group shutdown record.
+  release_runtime_ownership
 }
 trap on_exit EXIT
 
 # ── 收工 ──────────────────────────────────────────────────────────────
 # 顺序很重要（Codex R1 #2/#18）: 先把终止状态写进 state 让早报看到「已收工」而不是
-# 「运行中」，再出早报，再落 TERMINATED 标记 + 卸载 launchd，最后归档。
+# 「运行中」，再出早报；随后归档、落 TERMINATED 标记，最后卸载 launchd。
 finalize() {
   local why="$1"
+  # Terminal exits (cutoff, STOP, guard failure, exhausted retries) cannot
+  # leave unfinished work looking non-actionable in the morning report. Force
+  # every in-flight task to needs_human even when the prior process left a
+  # valid planned-hop marker: there will be no next hop to resume it.
+  if command -v node >/dev/null 2>&1 && [ -s "$STATE_DIR/current-run.json" ]; then
+    local terminal_q terminal_q_n
+    if terminal_q="$(cli_json quarantine-inflight force)" \
+       && terminal_q_n="$(jq_get "$terminal_q" count)"; then
+      clear_push_once finalize-quarantine-failure
+      [ "$terminal_q_n" -gt 0 ] \
+        && log "收工前已将 ${terminal_q_n} 个在途任务转 needs_human"
+    else
+      log "⚠️ 收工前无法隔离在途任务；早报中的任务状态可能不完整"
+      push_once finalize-quarantine-failure \
+        "⚠️ 夜班收工异常" "无法确认在途任务状态；请检查本机状态文件与目标仓库"
+    fi
+  fi
   log "收工: ${why}"
   # 持久化失败必须可见（Codex R3 #11）: 静默失败会让早报与 TERMINATED 状态互相矛盾
-  node "$CLI" mark-terminal-in-state "$why" >/dev/null 2>&1 \
-    || { log "⚠️ 终止状态写入失败"; push "⚠️ 夜班收工异常" "终止状态未能写入，请查看日志"; }
+  if node "$CLI" mark-terminal-in-state "$why" >/dev/null 2>&1; then
+    clear_push_once finalize-terminal-write-failure
+  else
+    log "⚠️ 终止状态写入失败"
+    push_once finalize-terminal-write-failure \
+      "⚠️ 夜班收工异常" "终止状态未能写入，请查看日志"
+  fi
   # 早报生成失败时**不能照旧推「☀️ 夜班早报」**（R10 自查）: 手机上说早报好了、
   # 打开却是上一夜的陈旧文件，比不推更糟。失败就照实推告警。
   local report_ok=yes
@@ -367,19 +626,23 @@ finalize() {
   done_n="$(jq_get "$sum" byStatus.done || echo 0)"
   nh="$(jq_get "$sum" needsHuman || echo '')"
   if [ "$report_ok" = yes ]; then
-    push "☀️ 夜班早报" "共 ${total} 任务，完成 ${done_n}${nh:+；待拍板 ${nh}}。收工原因: ${why}"
+    push_once finalize-summary "☀️ 夜班早报" "共 ${total} 任务，完成 ${done_n}${nh:+；待拍板 ${nh}}。收工原因: ${why}"
   else
-    push "⚠️ 早报生成失败" "夜班已收工（${why}），但早报未能生成，请查看 logs/ 与各仓库 git log"
+    push_once finalize-summary "⚠️ 早报生成失败" "夜班已收工（${why}），但早报未能生成，请查看 logs/ 与各仓库 git log"
   fi
   # 顺序: 归档 → 落终止标记 → 最后才自卸载（Codex R2 #13: 先卸载可能打断归档）
   # 归档失败就不落 TERMINATED、不卸载（Codex R4 #14）: 否则状态既没归档又被标终止，
   # 下一夜 init 会看到残留的活动状态而行为不明。留着让下一跳重试收工。
   if ! node "$CLI" archive >/dev/null 2>&1; then
     log "⚠️ 归档失败——不落终止标记，下一跳重试收工"
-    push "⚠️ 夜班收工异常" "归档失败，将在下次触发重试"
+    push_once archive-failure "⚠️ 夜班收工异常" "归档失败，将在下次触发重试"
     guard_uninstall 2>/dev/null || true
     FINISHED=yes; exit 1
   fi
+  clear_push_once finalize-summary
+  clear_push_once archive-failure
+  clear_push_once finalize-quarantine-failure
+  clear_push_once finalize-terminal-write-failure
   node "$CLI" terminal-set "${why}" >/dev/null 2>&1 \
     || { log "⚠️ TERMINATED 标记写入失败——下一跳可能重跑整夜"; push "⚠️ 夜班收工异常" "终止标记未写入"; }
   if ! guard_uninstall; then
@@ -388,10 +651,113 @@ finalize() {
     push "⚠️ 需要注意" "你的 pre-push hook 尚未恢复，夜班保持挂载以便重试"
     FINISHED=yes; exit 1
   fi
+  # Unload can SIGTERM this very process. Publish the finished state and
+  # release the lock/watchdog ledger before invoking it.
+  FINISHED=yes
+  release_runtime_ownership
   launchctl unload "$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist" 2>/dev/null \
     && log "已自卸载 launchd" || log "launchd 卸载跳过（可能未安装）"
-  FINISHED=yes
   exit 0
+}
+
+# Stop cleanly before a new run exists, or when dependency loss interrupts an active run.
+# The detailed error stays in the local log; the public ntfy body contains only a stable category.
+finish_without_run() {
+  local public_reason="$1" detail="$2" push_title="${3:-}" exit_code="${4:-0}"
+  local public_body="${5:-${public_reason}；详情见本机日志}"
+  local keep_loaded_if_unarchived="${6:-no}"
+  local push_key="${7:-finish-without-run}"
+  log "未开工收工: ${detail}"
+  local had_active=no can_archive=yes
+  local report_status='- 状态: 未开工或异常收工'
+  local report_action=''
+  if [ -s "$STATE_DIR/current-run.json" ]; then
+    had_active=yes
+    if command -v node >/dev/null 2>&1 \
+       && node -e 'process.exit(0)' >/dev/null 2>&1; then
+      local terminal_q terminal_q_n
+      if terminal_q="$(cli_json quarantine-inflight force)" \
+         && terminal_q_n="$(jq_get "$terminal_q" count)"; then
+        [ "$terminal_q_n" -gt 0 ] \
+          && log "异常收工前已将 ${terminal_q_n} 个在途任务转 needs_human"
+      else
+        log "⚠️ 异常收工前无法隔离在途任务；保留现状供人工诊断"
+      fi
+      # Dependency loss can happen after a run has started. Mark it terminal
+      # before rendering so an unloaded job cannot still look active.
+      if ! node "$CLI" mark-terminal-in-state "$public_reason" >/dev/null 2>&1; then
+        # The active state may itself be corrupt. Preserve it in place for
+        # diagnosis; the caller decides whether this path may terminate with
+        # an unarchived state (for example an explicit STOP).
+        log "⚠️ 活动运行的终止状态写入失败——保留原状态、不归档"
+        can_archive=no
+      fi
+    else
+      log "⚠️ 检测到活动运行但 node 不可用——保留原状态、不归档"
+      can_archive=no
+    fi
+  fi
+  if [ "$had_active" = yes ]; then
+    [ -n "$push_title" ] || push_title='⚠️ 夜班异常收工'
+    if [ "$can_archive" != yes ] && [ "$keep_loaded_if_unarchived" = yes ]; then
+      report_status='- 状态: 本跳暂停；本夜已有活动运行（未归档）'
+      report_action='- 待处理: 请检查本机状态文件与目标仓库残留；修复依赖后由下一跳重试'
+    elif [ "$can_archive" != yes ]; then
+      report_status='- 状态: 本跳终止；本夜已有活动运行（未归档）'
+      report_action='- 待处理: 本夜不会自动重试；重新武装前请核对状态与仓库，并归档或改名隔离 current-run.json，再执行 terminal-clear 并重新 load'
+      public_body="${public_body}；重新武装前请归档或改名隔离 current-run.json，再执行 terminal-clear 并重新 load"
+    else
+      report_status='- 状态: 本跳异常收工；检测到已有活动运行'
+      report_action='- 后续: 将尝试归档活动状态；若归档失败会保持 loaded 并告警重试'
+    fi
+  else
+    [ -n "$push_title" ] || push_title='⚠️ 夜班未开工'
+  fi
+  if ! node "$SKILL_DIR/bin/report.mjs" >/dev/null 2>&1; then
+    log "早报生成失败（未开工路径），写入最小故障早报"
+    local report_tmp="$SW_RUNTIME_HOME/morning-report.md.tmp.$$"
+    mkdir -p "$SW_RUNTIME_HOME" 2>/dev/null
+    { printf '# sleep-well-codex 早报\n\n';
+      printf '%s\n' "$report_status";
+      printf -- '- 原因: %s\n' "$public_reason";
+      [ -z "$report_action" ] || printf '%s\n' "$report_action";
+      printf -- '- 时间: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')";
+      printf '\n完整诊断见本机日志。\n'; } >"$report_tmp" 2>/dev/null \
+      && mv -f "$report_tmp" "$SW_RUNTIME_HOME/morning-report.md" 2>/dev/null \
+      || { rm -f "$report_tmp" 2>/dev/null; log "最小故障早报写入失败"; }
+  fi
+  push_once "$push_key" "$push_title" "$public_body"
+  if [ "$had_active" = yes ] && [ "$can_archive" != yes ] \
+     && [ "$keep_loaded_if_unarchived" = yes ]; then
+    # A dependency may recover on the next launchd interval. Keep the active
+    # state attached to a live retry path; fixed push_once text prevents spam.
+    log "⚠️ 活动状态未归档——不落 TERMINATED、不卸载，留待依赖恢复后重试"
+    FINISHED=yes; exit 1
+  fi
+  if [ "$had_active" = yes ] && [ "$can_archive" = yes ] \
+     && ! node "$CLI" archive >/dev/null 2>&1; then
+    # Match finalize(): never leave a TERMINATED marker next to an unarchived
+    # active run, because clearing the marker next night would revive stale state.
+    log "⚠️ 活动运行归档失败——不落终止标记、不卸载，留待下一跳重试"
+    push_once archive-failure "⚠️ 夜班收工异常" "活动状态归档失败，将在下次触发重试"
+    guard_uninstall 2>/dev/null || true
+    FINISHED=yes; exit 1
+  fi
+  clear_push_once "$push_key"
+  clear_push_once archive-failure
+  if ! node "$CLI" terminal-set "$public_reason" >/dev/null 2>&1; then
+    # node itself may be the missing dependency. The orchestrator only checks
+    # for marker existence, so a plain-text fallback still prevents a push loop.
+    mkdir -p "$SW_RUNTIME_HOME" 2>/dev/null
+    printf 'at=%s\nreason=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$public_reason" \
+      >"$SW_RUNTIME_HOME/TERMINATED" 2>/dev/null \
+      || { log "⚠️ TERMINATED 标记写入失败（未开工路径）"; push "⚠️ 夜班收工异常" "终止标记未写入"; }
+  fi
+  FINISHED=yes
+  release_runtime_ownership
+  launchctl unload "$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist" 2>/dev/null \
+    && log "已自卸载 launchd" || log "launchd 卸载跳过（可能未安装）"
+  exit "$exit_code"
 }
 
 # ── 护栏 ──────────────────────────────────────────────────────────────
@@ -405,6 +771,8 @@ finalize() {
 #    它在这里仅作纵深防御，且必须保存/恢复用户原有的 hook（Codex R2 #2:
 #    否则夜班跑一次就永久破坏用户自己的 push 流程）。
 GUARD_HEAD=""; GUARD_REFS=""; GUARD_BRANCH=""; GUARD_PROT=""; GUARD_HOOK_BAK=""
+GUARD_GIT_META=""; GUARD_META_DOTGIT=""; GUARD_META_GITDIR=""; GUARD_META_COMMON=""; GUARD_META_HOOKS=""
+GUARD_ABORT_REASON="护栏不可得"
 HOOK_PATH=""
 
 # ── hook 恢复状态机（Codex R8 #6-#11 整体重做）──────────────────────────
@@ -425,7 +793,7 @@ HOOK_PATH=""
 #      当前 hook 不是我们的但备份也在（冲突）——都不清状态、告警、返回非零。
 # >>>TESTABLE:hook>>>  （test/hook-state.test.sh 按这对标记抽取，勿删）
 HOOK_SENTINEL="sleep-well-codex-guard-hook-v1"
-HOOK_STATE="$CODEX_HOME/hook-recovery.json"
+HOOK_STATE="$SW_RUNTIME_HOME/hook-recovery.json"
 
 # 身份判据经过三轮才定型，三条约束缺一不可:
 #   R9 #9  —— 不能是「包含公开的静态哨兵串」: 用户从我们的版本改来的 hook 会碰撞，
@@ -486,8 +854,12 @@ _clear_hook_state() { rm -f "$HOOK_STATE" 2>/dev/null; }
 recover_pending_hook() {
   [ -f "$HOOK_STATE" ] || return 0
   local raw hp bk tok
+  if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(0)' >/dev/null 2>&1; then
+    log "⚠️ node 不可用，无法解析 hook 恢复元数据；保留原文件待重试"
+    return 2
+  fi
   raw="$(cat "$HOOK_STATE" 2>/dev/null)" || {
-    log "⚠️ hook 恢复元数据不可读，拒绝继续"; push "⚠️ 需要手动处理" "hook 恢复元数据不可读"; return 1; }
+    log "⚠️ hook 恢复元数据不可读，拒绝继续"; return 1; }
   # 解析失败**不等于**无需恢复（R8 #9）: 原实现把 jq_get 的失败折叠成空串然后删掉记录，
   # 于是既留下了阻断 hook，又丢掉了定位用户备份的唯一线索。
   hp="$(jq_get "$raw" hook)" || hp=""
@@ -495,7 +867,6 @@ recover_pending_hook() {
   tok="$(jq_get "$raw" token)" || tok=""
   if [ -z "$hp" ]; then
     log "⚠️ hook 恢复元数据损坏（保留原文件待人工处理）: $(printf '%.120s' "$raw")"
-    push "⚠️ 需要手动处理" "hook 恢复元数据损坏，夜班拒绝继续"
     return 1
   fi
   log "发现上一次遗留的 hook 恢复任务: ${hp}"
@@ -512,12 +883,10 @@ recover_pending_hook() {
         log "已恢复用户原有 hook"; _clear_hook_state; return 0
       fi
       log "⚠️ 仍无法恢复原有 hook（备份: ${bk}）"
-      push "⚠️ 需要手动处理" "pre-push hook 仍未恢复，备份见日志"
       return 1
     fi
     # 用户在崩溃后自己换了 hook——两份都留着，交人工（R8 #10）
     log "⚠️ 当前 pre-push 不是夜班装的，且备份仍在: 冲突，两份都保留待人工"
-    push "⚠️ 需要手动处理" "pre-push 冲突: 现有文件与夜班备份并存，未做任何覆盖"
     return 1
   fi
 
@@ -529,17 +898,16 @@ recover_pending_hook() {
     #    后来的安装还会把它当成「用户自己的 hook」备份并恢复，把错误固化下去。
     if _hook_is_ours "$hp" "$tok"; then
       rm -f "$hp" 2>/dev/null || {
-        log "⚠️ 无法移除遗留的夜班 hook: ${hp}"; push "⚠️ 需要手动处理" "遗留的夜班 hook 未能移除"; return 1; }
+        log "⚠️ 无法移除遗留的夜班 hook: ${hp}"; return 1; }
     elif [ -e "$hp" ]; then
       # 无 token 的旧记录（R9 → R10 升级）: 用旧版哨兵体做一次性识别，认出来就清掉。
       if [ -z "$tok" ] && _hook_is_legacy_ours "$hp"; then
         log "识别出 R9 时代的夜班 hook（无 token 记录），已移除"
         rm -f "$hp" 2>/dev/null || {
-          log "⚠️ 无法移除遗留的夜班 hook: ${hp}"; push "⚠️ 需要手动处理" "遗留的夜班 hook 未能移除"; return 1; }
+          log "⚠️ 无法移除遗留的夜班 hook: ${hp}"; return 1; }
       else
         # 既不是本版的、也不是旧版的 —— 不认识就不动，更不能清掉唯一的记录
         log "⚠️ ${hp} 存在但无法确认归属，保留文件与恢复记录待人工"
-        push "⚠️ 需要手动处理" "pre-push 归属不明，夜班未做任何改动"
         return 1
       fi
     fi
@@ -548,7 +916,6 @@ recover_pending_hook() {
 
   # 记录过备份却找不到文件——绝不当成成功（R8 #12）。此时不动任何文件。
   log "⚠️ 恢复元数据记录了备份 ${bk} 但文件不存在，保留状态并中止"
-  push "⚠️ 需要手动处理" "pre-push 备份文件缺失，夜班拒绝继续"
   return 1
 }
 
@@ -622,11 +989,93 @@ guard_uninstall() {
 
 # <<<TESTABLE:hook<<<
 
+# Resolve every repository-controlled metadata path while Git configuration is
+# still trusted, then hash those paths with Node only. Verification after an AI
+# process must not invoke Git before this check: a modified config could install
+# a clean filter/fsmonitor command, and a modified hook could run at checkpoint.
+_resolve_git_meta_paths() {
+  local repo="$1" gd common hook_cfg hook_rc
+  gd="$(git -C "$repo" rev-parse --git-dir 2>>"$RUNLOG")" || return 1
+  common="$(git -C "$repo" rev-parse --git-common-dir 2>>"$RUNLOG")" || return 1
+  case "$gd" in /*) : ;; *) gd="$repo/$gd" ;; esac
+  case "$common" in /*) : ;; *) common="$repo/$common" ;; esac
+  gd="$(cd "$gd" 2>/dev/null && pwd -P)" || return 1
+  common="$(cd "$common" 2>/dev/null && pwd -P)" || return 1
+
+  hook_cfg="$(git -C "$repo" config --path --get core.hooksPath 2>>"$RUNLOG")"
+  hook_rc=$?
+  if [ "$hook_rc" -eq 1 ]; then
+    hook_cfg="$common/hooks"
+  elif [ "$hook_rc" -ne 0 ]; then
+    log "护栏: 无法解析 core.hooksPath"
+    return 1
+  elif [ -z "$hook_cfg" ]; then
+    hook_cfg="$common/hooks"
+  else
+    case "$hook_cfg" in /*) : ;; *) hook_cfg="$repo/$hook_cfg" ;; esac
+  fi
+
+  GUARD_META_DOTGIT=""
+  if [ -f "$repo/.git" ] || [ -L "$repo/.git" ]; then GUARD_META_DOTGIT="$repo/.git"; fi
+  GUARD_META_GITDIR="$gd"
+  GUARD_META_COMMON="$common"
+  GUARD_META_HOOKS="$hook_cfg"
+  return 0
+}
+
+_git_meta_digest() {
+  local raw
+  raw="$(node "$CLI" path-content-snapshot \
+    "$GUARD_META_DOTGIT" \
+    "$GUARD_META_GITDIR/config" "$GUARD_META_GITDIR/config.worktree" \
+    "$GUARD_META_GITDIR/info/attributes" "$GUARD_META_GITDIR/info/exclude" "$GUARD_META_GITDIR/info/sparse-checkout" "$GUARD_META_GITDIR/info/grafts" \
+    "$GUARD_META_GITDIR/hooks" \
+    "$GUARD_META_COMMON/config" "$GUARD_META_COMMON/config.worktree" \
+    "$GUARD_META_COMMON/info/attributes" "$GUARD_META_COMMON/info/exclude" "$GUARD_META_COMMON/info/sparse-checkout" "$GUARD_META_COMMON/info/grafts" \
+    "$GUARD_META_COMMON/hooks" \
+    "$GUARD_META_COMMON/objects/info/alternates" "$GUARD_META_COMMON/objects/info/http-alternates" \
+    "$GUARD_META_HOOKS" 2>>"$RUNLOG")" || return 1
+  jq_get "$raw" digest
+}
+
+guard_git_meta_snapshot() {
+  local repo="$1"
+  _resolve_git_meta_paths "$repo" || {
+    log "护栏快照失败: 无法解析 Git 元数据路径"
+    return 1
+  }
+  GUARD_GIT_META="$(_git_meta_digest)" || {
+    log "护栏快照失败: 无法摘要 Git 元数据"
+    return 1
+  }
+  [ -n "$GUARD_GIT_META" ] || { log "护栏快照失败: Git 元数据摘要为空"; return 1; }
+}
+
+guard_git_meta_verify() {
+  local repo="$1" now
+  # Do not re-resolve paths with Git here. The baseline paths were captured
+  # before AI execution; using a possibly modified config to choose what to
+  # verify would let the modification move itself outside the check.
+  now="$(_git_meta_digest)" || {
+    GUARD_ABORT_REASON="护栏不可得"
+    log "护栏核验失败: 无法摘要 Git 元数据"
+    push "🚨 护栏核验失败" "无法核验 Git hooks/config，夜班已中止"
+    return 1
+  }
+  if [ "$now" != "$GUARD_GIT_META" ]; then
+    GUARD_ABORT_REASON="护栏违规"
+    log "护栏违规: Git hooks/config/info 元数据发生变化"
+    push "🚨 护栏违规" "检出 Git 元数据变化，夜班已中止"
+    return 1
+  fi
+  return 0
+}
+
 # 列出受保护文件（已跟踪 **+ 未跟踪未忽略**——Codex R2 #5: 原实现只看已跟踪，
 # 新增的合同/凭据类文件漏检）。失败返回非零，调用方失败关闭（Codex R2 #4）。
 #
 # 「什么算受保护」**只有一处定义**: lib/guardrails.mjs 的 isProtectedPath，
-# 经 `cli.mjs protected-in` 调用。本函数只负责枚举候选与摘要内容，不做任何模式判断。
+# 经 `cli.mjs protected-in-null` 调用。本函数只负责枚举候选与摘要内容，不做任何模式判断。
 # >>>TESTABLE:prot-hash>>>  （test/prot-hash.test.sh 按这对标记抽取，勿删）
 PROT_MAX_ENTRIES=500000        # 总候选条目上限（20 万实测 0.33s，留足余量）
 PROT_MAX_DIR_ENTRIES=20000     # 单个受保护链接所指目录的展开上限（含递归后代）
@@ -641,55 +1090,112 @@ PROT_MAX_DIR_ENTRIES=20000     # 单个受保护链接所指目录的展开上�
 # $1=绝对目录 $2=real_repo $3=visited 文件（防环） $4=计数文件（有界）
 # 任何读取失败一律 return 1（失败关闭），绝不用常量占位。
 _dir_digest() {
-  local d="$1" real_repo="$2" vis="$3" cnt="$4" out="" e rp n lst sub one id
+  local d="$1" real_repo="$2" vis="$3" cnt="$4" out="" e rp n lst sub one id dmode tmode
+  local modesf entries_n modes_n emode extra_mode entry_sum entry_key link_text link_sum link_key sub_sum sub_key
   # ⚠️ visited 身份用 **dev:inode**，不用路径（Codex R11 #3）:
   #    路径写进按行分隔的文件，含换行的目录名会裂成多条——比如某个链接指向 `z\nfoo`，
   #    留下的 `/repo/z` 那行会让后来真实的 `/repo/z` 目录被误判成环而整个跳过，
   #    改它底下的文件护栏毫无反应。这是 R9 #3 那个「行协议」缺陷在我新写的代码里复发。
   #    dev:inode 天然无换行，还能识破硬链接与经不同路径到达的同一目录（实测 a 与 alink/ 同号）。
-  id="$(stat -f '%d:%i' "$d" 2>/dev/null)" || return 1
+  id="$(stat -f '%d:%i' "$d" 2>>"$RUNLOG")" \
+    || { log "护栏: stat 目录身份失败: ${d}"; return 1; }
+  dmode="$(stat -f '%p' "$d" 2>>"$RUNLOG")" \
+    || { log "护栏: stat 目录权限失败: ${d}"; return 1; }
+  out="${out}DIRMODE ${id} ${dmode}"$'\n'
   [ -n "$id" ] || return 1
   grep -qxF -- "$id" "$vis" 2>/dev/null && { printf 'CYCLE %s\n' "$id"; return 0; }
   printf '%s\n' "$id" >>"$vis" || return 1
   lst="$(mktemp)" || return 1
-  find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | LC_ALL=C sort -z >"$lst" || { rm -f "$lst"; return 1; }
+  # A protected symlink may resolve to the repository root. The adapter-owned
+  # .review tree and Git's own mutable metadata remain excluded there exactly
+  # as they are in the top-level task baseline and checkpoint pathspecs.
+  if [ "$d" = "$real_repo" ]; then
+    find "$d" -mindepth 1 -maxdepth 1 ! -name .review ! -name .git -print0 2>>"$RUNLOG" \
+      | LC_ALL=C sort -z >"$lst" \
+      || { log "护栏: 枚举受保护目录失败: ${d}"; rm -f "$lst"; return 1; }
+  else
+    find "$d" -mindepth 1 -maxdepth 1 -print0 2>>"$RUNLOG" \
+      | LC_ALL=C sort -z >"$lst" \
+      || { log "护栏: 枚举受保护目录失败: ${d}"; rm -f "$lst"; return 1; }
+  fi
+  # Mode metadata is part of the protected snapshot. Keep it in a parallel
+  # newline-safe stream (modes contain no newlines); paths remain NUL-framed and
+  # are represented below only by fixed-length SHA-256 keys.
+  modesf="$(mktemp)" || { rm -f "$lst"; return 1; }
+  if [ -s "$lst" ]; then
+    xargs -0 stat -f '%p' <"$lst" >"$modesf" 2>>"$RUNLOG" \
+      || { log "护栏: 批量读取目录条目权限失败: ${d}"; rm -f "$lst" "$modesf"; return 1; }
+  fi
+  entries_n="$(tr -dc '\0' <"$lst" | wc -c | tr -d ' ')" \
+    || { rm -f "$lst" "$modesf"; return 1; }
+  modes_n="$(wc -l <"$modesf" | tr -d ' ')" \
+    || { rm -f "$lst" "$modesf"; return 1; }
+  [ "$entries_n" = "$modes_n" ] || { rm -f "$lst" "$modesf"; return 1; }
+  exec 7<"$modesf" || { rm -f "$lst" "$modesf"; return 1; }
   while IFS= read -r -d '' e; do
-    n="$(cat "$cnt" 2>/dev/null)" || { rm -f "$lst"; return 1; }
+    IFS= read -r emode <&7 || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+    entry_sum="$(printf '%s' "$e" | shasum -a 256)" \
+      || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+    entry_key="${entry_sum%% *}"
+    out="${out}ENTRY ${entry_key} ${emode}"$'\n'
+    n="$(cat "$cnt" 2>/dev/null)" || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
     n=$((n + 1)); printf '%s\n' "$n" >"$cnt"
+    [ $((n % 20)) -eq 0 ] && beat
     if [ "$n" -gt "$PROT_MAX_DIR_ENTRIES" ]; then
       log "护栏: 受保护目录展开超过 ${PROT_MAX_DIR_ENTRIES} 条，失败关闭"
-      rm -f "$lst"; return 1
+      exec 7<&-; rm -f "$lst" "$modesf"; return 1
     fi
     if [ -L "$e" ]; then
-      out="${out}L $(readlink "$e" 2>/dev/null) ${e}"$'\n'
+      link_text="$(readlink "$e" 2>>"$RUNLOG")" \
+        || { log "护栏: readlink 失败: ${e}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+      link_sum="$(printf '%s' "$link_text" | shasum -a 256)" \
+        || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+      link_key="${link_sum%% *}"
+      out="${out}LINK ${entry_key} ${link_key}"$'\n'
       if rp="$(realpath "$e" 2>/dev/null)"; then
         case "$rp" in
           "$real_repo"|"$real_repo"/*)
             if [ -d "$rp" ]; then
-              sub="$(_dir_digest "$rp" "$real_repo" "$vis" "$cnt")" || { rm -f "$lst"; return 1; }
-              out="${out}${sub}"
+              sub="$(_dir_digest "$rp" "$real_repo" "$vis" "$cnt")" \
+                || { log "护栏: 摘要链接目录失败: ${rp}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+              sub_sum="$(printf '%s' "$sub" | shasum -a 256)" \
+                || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+              sub_key="${sub_sum%% *}"
+              out="${out}SUBDIR ${entry_key} ${sub_key}"$'\n'
             elif [ -f "$rp" ]; then
-              one="$(shasum -a 256 "$rp" 2>/dev/null)" || { rm -f "$lst"; return 1; }
-              out="${out}${one}"$'\n'
+              tmode="$(stat -f '%p' "$rp" 2>>"$RUNLOG")" \
+                || { log "护栏: stat 链接目标失败: ${rp}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+              one="$(shasum -a 256 <"$rp" 2>>"$RUNLOG")" \
+                || { log "护栏: 哈希链接目标失败: ${rp}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+              out="${out}TARGETFILE ${entry_key} ${tmode} ${one%% *}"$'\n'
             else
-              out="${out}NOT-A-REGULAR-FILE ${e}"$'\n'
+              out="${out}NOT-A-REGULAR-FILE ${entry_key}"$'\n'
             fi ;;
-          *) out="${out}OUTSIDE-REPO ${e}"$'\n' ;;
+          *) out="${out}OUTSIDE-REPO ${entry_key}"$'\n' ;;
         esac
       else
-        out="${out}UNRESOLVABLE ${e}"$'\n'
+        out="${out}UNRESOLVABLE ${entry_key}"$'\n'
       fi
     elif [ -d "$e" ]; then
-      sub="$(_dir_digest "$e" "$real_repo" "$vis" "$cnt")" || { rm -f "$lst"; return 1; }
-      out="${out}${sub}"
+      sub="$(_dir_digest "$e" "$real_repo" "$vis" "$cnt")" \
+        || { log "护栏: 摘要子目录失败: ${e}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+      sub_sum="$(printf '%s' "$sub" | shasum -a 256)" \
+        || { exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+      sub_key="${sub_sum%% *}"
+      out="${out}SUBDIR ${entry_key} ${sub_key}"$'\n'
     elif [ -f "$e" ]; then
-      one="$(shasum -a 256 "$e" 2>/dev/null)" || { rm -f "$lst"; return 1; }
-      out="${out}${one}"$'\n'
+      one="$(shasum -a 256 <"$e" 2>>"$RUNLOG")" \
+        || { log "护栏: 哈希目录文件失败: ${e}"; exec 7<&-; rm -f "$lst" "$modesf"; return 1; }
+      out="${out}FILE ${entry_key} ${one%% *}"$'\n'
     else
-      out="${out}SPECIAL ${e}"$'\n'
+      out="${out}SPECIAL ${entry_key}"$'\n'
     fi
   done <"$lst"
-  rm -f "$lst"
+  if IFS= read -r extra_mode <&7; then
+    exec 7<&-; rm -f "$lst" "$modesf"; return 1
+  fi
+  exec 7<&-
+  rm -f "$lst" "$modesf"
   printf '%s' "$out"
 }
 # realpath 缺失（旧版 macOS）时每个受保护链接都会稳定落到 UNRESOLVABLE，而函数照样返回成功——
@@ -707,11 +1213,16 @@ _prot_hash() {
   exp="$(mktemp)" || { rm -f "$lst"; return 1; }
   # 三条枚举各自检查退出码（Codex R5 #4）: 合在一个 {} 里只有整体失败才捕获，
   # 其中一条静默失败会让那一类文件整体从受保护快照中消失。
-  git -C "$repo" ls-files -z >"$lst" 2>/dev/null || { rm -f "$lst" "$exp"; return 1; }
-  git -C "$repo" ls-files -z --others --exclude-standard >>"$lst" 2>/dev/null || { rm -f "$lst" "$exp"; return 1; }
+  # .review is the review adapter's allowed output namespace. Exclude it from
+  # the protected snapshot just as baseline checks and checkpoint commits do;
+  # otherwise a finding filename containing "contract" can trip the guard.
+  git -C "$repo" ls-files -z -- . ':(exclude).review' >"$lst" 2>>"$RUNLOG" \
+    || { log "护栏: git ls-files tracked 失败: ${repo}"; rm -f "$lst" "$exp"; return 1; }
+  git -C "$repo" ls-files -z --others --exclude-standard -- . ':(exclude).review' >>"$lst" 2>>"$RUNLOG" \
+    || { log "护栏: git ls-files untracked 失败: ${repo}"; rm -f "$lst" "$exp"; return 1; }
   # ignored 用 --directory 折叠（性能: 不展开 node_modules 的十万个文件）
-  git -C "$repo" ls-files -z --others --ignored --exclude-standard --directory >>"$lst" 2>/dev/null \
-    || { rm -f "$lst" "$exp"; return 1; }
+  git -C "$repo" ls-files -z --others --ignored --exclude-standard --directory -- . ':(exclude).review' >>"$lst" 2>>"$RUNLOG" \
+    || { log "护栏: git ls-files ignored 失败: ${repo}"; rm -f "$lst" "$exp"; return 1; }
 
   # ── 展开被折叠的 ignored 目录，**不做任何 shell 层模式预筛**（Codex R8 #3）──
   #
@@ -724,24 +1235,35 @@ _prot_hash() {
   # 实测: 5 份权威判定为受保护的文件，只有 1 份进了摘要，改其余 4 份护栏毫无反应。
   #
   # R7 #2 的真实成因**不是耗时**，是那个 20000 的单目录硬上限失败关闭。实测代价:
-  #   20 万文件 find 全展开 0.20s + 20 万条过 protected-in 0.05s，整函数 0.33s。
+  #   20 万文件 find 全展开 0.20s + 20 万条过 protected-in-null 0.05s，整函数 0.33s。
   # 全展开不构成性能问题，所以正解是**删掉第二处模式集**，而不是给它补四条模式。
   # ⚠️ 整条管线必须是 **NUL 分隔**（Codex R9 #3，已实测）: git 允许文件名含换行，
   #    原来 `tr '\0' '\n'` 一上来就把 NUL 换成换行，`legal\nnotes.txt` 被拆成两条，
   #    权威判定看到的是并不存在的 `legal`，真实文件从头到尾没进过摘要——改它护栏毫无反应。
-  #    所以: ls-files -z → find -print0 → protected-in --null → read -d ''，全程不落行协议。
+  #    所以: ls-files -z → find -print0 → protected-in-null → read -d ''，全程不落行协议。
   # ⚠️ 初始化与每一次追加都要检查（Codex R20 #1 报的是 `plain`，我复现时发现 `exp`
   #    上有同一个缺陷、而且从 R8 起就在）: 磁盘满/配额/只读时这些写入静默失败，
   #    随后的计数是从**这个空文件**算出来的——自洽但错误，结果是
   #    「退出码 0、stdout 零字节」的静默漏检（正常应为 185 字节）。实测复现过。
   : >"$exp" || { log "护栏: 无法初始化枚举列表（磁盘/配额？）"; rm -f "$lst" "$exp"; return 1; }
-  local e exp_n=0
+  local e exp_n=0 one k enum_i=0
   while IFS= read -r -d '' e; do
     [ -z "$e" ] && continue
+    enum_i=$((enum_i + 1))
+    [ $((enum_i % 20)) -eq 0 ] && beat
     if [ -d "$repo/$e" ]; then
-      (cd "$repo" && find "$e" \( -type f -o -type l \) -print0 2>/dev/null) >>"$exp" || {
-        log "护栏: 展开被忽略目录失败"; rm -f "$lst" "$exp"; return 1; }
-      exp_n=$(( exp_n + $(tr -dc '\0' <"$exp" | wc -c | tr -d ' ') - exp_n ))
+      one="$(mktemp)" || { rm -f "$lst" "$exp"; return 1; }
+      (cd "$repo" && find "$e" \( -type f -o -type l \) -print0 2>>"$RUNLOG" | LC_ALL=C sort -z) >"$one"
+      local find_rc=$?
+      if [ "$find_rc" -ne 0 ]; then
+        log "护栏: 展开被忽略目录失败: ${repo}/${e}"; rm -f "$one" "$lst" "$exp"; return 1
+      fi
+      k="$(tr -dc '\0' <"$one" | wc -c | tr -d ' ')" \
+        || { rm -f "$one" "$lst" "$exp"; return 1; }
+      cat "$one" >>"$exp" \
+        || { log "护栏: 写入目录展开列表失败"; rm -f "$one" "$lst" "$exp"; return 1; }
+      rm -f "$one"
+      exp_n=$((exp_n + k))
     else
       printf '%s\0' "$e" >>"$exp" || { log "护栏: 写入枚举列表失败"; rm -f "$lst" "$exp"; return 1; }
       exp_n=$((exp_n + 1))
@@ -764,25 +1286,46 @@ _prot_hash() {
     rm -f "$exp"; return 1
   fi
 
-  local prot; prot="$(node "$CLI" protected-in --null "$exp" 2>/dev/null)" || { rm -f "$exp"; return 1; }
-  rm -f "$exp"
   local pf; pf="$(mktemp)" || return 1
-  printf '%s' "$prot" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{(JSON.parse(s).protected||[]).forEach(p=>process.stdout.write(p+"\0"))}catch{process.exit(1)}})' >"$pf" || { rm -f "$pf"; return 1; }
+  # Keep original filename bytes all the way through selection and output.
+  # JSON strings cannot represent a non-UTF-8 POSIX filename losslessly.
+  node "$CLI" protected-in-null "$exp" "$pf" >/dev/null 2>>"$RUNLOG" \
+    || { log "护栏: protected-in 权威判定失败: ${repo}"; rm -f "$exp" "$pf"; return 1; }
+  rm -f "$exp"
 
   # 可选: 把解析后的受保护清单导出给调用方（备份用）。NUL 分隔。
-  [ -n "${PROT_LIST_OUT:-}" ] && cp "$pf" "$PROT_LIST_OUT" 2>/dev/null
-  local real_repo; real_repo="$(cd "$repo" && pwd -P)" || return 1
+  if [ -n "${PROT_LIST_OUT:-}" ] && ! cp "$pf" "$PROT_LIST_OUT" 2>>"$RUNLOG"; then
+    # The content guard itself remains valid, so do not turn a recovery-copy
+    # failure into a guard false positive. It must still be loud: every
+    # untracked protected file will lack a restorable pre-change copy.
+    log "⚠️ 无法导出受保护清单，本次不做未跟踪凭据备份"
+    push "⚠️ 部分受保护文件无备份" "受保护清单导出失败；护栏报警时这些文件无副本可还原"
+  fi
+  local real_repo; real_repo="$(cd "$repo" && pwd -P)" \
+    || { log "护栏: 仓库规范化失败: ${repo}"; return 1; }
   local plain plain_n=0
   plain="$(mktemp)" || return 1
   : >"$plain" || { rm -f "$plain"; return 1; }
-  local f
+  local f prot_i=0 fmode tmode fsum fkey lsum lkey
   while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
+    prot_i=$((prot_i + 1))
+    [ $((prot_i % 20)) -eq 0 ] && beat
     if [ -L "$repo/$f" ]; then
       # 链接文本入摘要（R6 #5: 改指向即可绕过内容哈希）**并且**摘要它所指的内容
       # （R7 #3: `tmpstuff/.env -> payload` 时改 payload 不改链接文本，凭据修改绕过护栏）。
-      local lt; lt="$(readlink "$repo/$f" 2>/dev/null)" || return 1
-      h="${h}LINK ${lt} ${f}"$'\n'
+      local lt; lt="$(readlink "$repo/$f" 2>>"$RUNLOG")" \
+        || { log "护栏: readlink 失败: ${repo}/${f}"; return 1; }
+      fsum="$(printf '%s' "$f" | shasum -a 256 2>>"$RUNLOG")" \
+        || { log "护栏: 哈希受保护路径名失败"; return 1; }
+      fkey="${fsum%% *}"
+      lsum="$(printf '%s' "$lt" | shasum -a 256 2>>"$RUNLOG")" \
+        || { log "护栏: 哈希链接文本失败: ${repo}/${f}"; return 1; }
+      lkey="${lsum%% *}"
+      fmode="$(stat -f '%p' "$repo/$f" 2>>"$RUNLOG")" \
+        || { log "护栏: stat 受保护链接失败: ${repo}/${f}"; return 1; }
+      h="${h}LINKMODE ${fmode} ${fkey}"$'\n'
+      h="${h}LINK ${lkey} ${fkey}"$'\n'
       # ⚠️ R7 那版自己拼路径: dirname(链接自身) + basename(链接文本)——**把链接文本里的
       #    目录部分丢了**。`tmp/.env -> ../data/blob.txt` 被解析成 `tmp/blob.txt`（不存在），
       #    于是连 TARGET 行都不产生，改 data/blob.txt 完全无感知（R8 #4，已实测）。
@@ -797,8 +1340,12 @@ _prot_hash() {
         case "$real_tgt" in
           "$real_repo"|"$real_repo"/*)
             if [ -f "$real_tgt" ]; then
-              local tc; tc="$(shasum -a 256 "$real_tgt" 2>/dev/null)" || return 1
-              h="${h}TARGET ${f} ${tc}"$'\n'
+              tmode="$(stat -f '%p' "$real_tgt" 2>>"$RUNLOG")" \
+                || { log "护栏: stat 链接目标失败: ${real_tgt}"; return 1; }
+              h="${h}TARGETMODE ${fkey} ${tmode}"$'\n'
+              local tc; tc="$(shasum -a 256 <"$real_tgt" 2>>"$RUNLOG")" \
+                || { log "护栏: 哈希链接目标失败: ${real_tgt}"; return 1; }
+              h="${h}TARGET ${fkey} ${tc%% *}"$'\n'
             elif [ -d "$real_tgt" ]; then
               # 指向目录时也要摘要目录内容（R8 #4），且必须**递归跟随内部的目录链接**
               # （R10 #2）——否则 `.env.dir -> data`、`data/nested -> ../target` 时
@@ -808,19 +1355,20 @@ _prot_hash() {
               vf="$(mktemp)" || return 1
               cf="$(mktemp)" || { rm -f "$vf"; return 1; }
               printf '0\n' >"$cf"
-              dtc="$(_dir_digest "$real_tgt" "$real_repo" "$vf" "$cf")" || { rm -f "$vf" "$cf"; return 1; }
+              dtc="$(_dir_digest "$real_tgt" "$real_repo" "$vf" "$cf")" \
+                || { log "护栏: 摘要受保护链接目录失败: ${real_tgt}"; rm -f "$vf" "$cf"; return 1; }
               local dn; dn="$(cat "$cf" 2>/dev/null)" || dn="?"
               rm -f "$vf" "$cf"
               dtc="$(printf '%s' "$dtc" | shasum -a 256)" || return 1
-              h="${h}TARGETDIR ${f} ${dn} ${dtc}"$'\n'
+              h="${h}TARGETDIR ${fkey} ${dn} ${dtc}"$'\n'
             else
-              h="${h}TARGET ${f} NOT-A-REGULAR-FILE"$'\n'
+              h="${h}TARGET ${fkey} NOT-A-REGULAR-FILE"$'\n'
             fi ;;
-          *) h="${h}TARGET ${f} OUTSIDE-REPO"$'\n' ;;
+          *) h="${h}TARGET ${fkey} OUTSIDE-REPO"$'\n' ;;
         esac
       else
         # 悬空 / 成环: **记录状态**而不是静默跳过——夜里它变成有效文件时摘要必须变化
-        h="${h}TARGET ${f} UNRESOLVABLE"$'\n'
+        h="${h}TARGET ${fkey} UNRESOLVABLE"$'\n'
       fi
     elif [ -f "$repo/$f" ]; then
       # 普通文件攒起来批量哈希（见下）——逐个 shasum 是进程创建开销，实测 1 万个文件
@@ -831,6 +1379,22 @@ _prot_hash() {
       #    自洽的校验不等于正确的校验: 计数必须锚在**打算写入的条数**上。
       printf '%s\0' "$repo/$f" >>"$plain" || { log "护栏: 写入哈希输入失败（磁盘/配额？）"; rm -f "$plain"; return 1; }
       plain_n=$((plain_n + 1))
+    elif [ ! -e "$repo/$f" ]; then
+      # A tracked path remains in `git ls-files` after deletion. Record the
+      # missing state in the digest so snapshot-vs-verify classifies it as an
+      # actual protected-path change, not as unavailable guard telemetry.
+      fsum="$(printf '%s' "$f" | shasum -a 256 2>>"$RUNLOG")" \
+        || { log "护栏: 哈希缺失受保护路径名失败"; rm -f "$pf" "$plain"; return 1; }
+      fkey="${fsum%% *}"
+      log "护栏: 受保护路径缺失: ${repo}/${f}"
+      h="${h}MISSING ${fkey}"$'\n'
+    else
+      # The selector received this byte-exact path from the just-built
+      # enumeration. Silently skipping it would make snapshot and verify agree
+      # on an incomplete protected set (notably after filename transcoding).
+      log "护栏: 受保护清单条目既非普通文件也非链接，失败关闭: ${repo}/${f}"
+      rm -f "$pf" "$plain"
+      return 1
     fi
   done <"$pf"
   rm -f "$pf"
@@ -840,8 +1404,17 @@ _prot_hash() {
   #    而 snapshot 与 verify 每个任务各跑一次。
   #    xargs 任一批失败返回 123/124/125，`|| return 1` 即失败关闭，不会静默少查。
   if [ -s "$plain" ]; then
-    local bulk
-    bulk="$(xargs -0 shasum -a 256 <"$plain" 2>/dev/null | LC_ALL=C sort)" || { rm -f "$plain"; return 1; }
+    local bulk bulk_rc mode_json mode_n mode_digest
+    bulk="$(xargs -0 shasum -a 256 <"$plain" 2>>"$RUNLOG" | LC_ALL=C sort)"
+    bulk_rc=$?
+    [ "$bulk_rc" -eq 0 ] \
+      || { log "护栏: 批量哈希受保护文件失败: ${repo}"; rm -f "$plain"; return 1; }
+    mode_json="$(node "$CLI" mode-list-snapshot "$plain" 2>>"$RUNLOG")" \
+      || { log "护栏: 批量读取受保护文件权限失败: ${repo}"; rm -f "$plain"; return 1; }
+    mode_n="$(jq_get "$mode_json" count)" \
+      || { log "护栏: 权限快照条数不可得"; rm -f "$plain"; return 1; }
+    mode_digest="$(jq_get "$mode_json" digest)" \
+      || { log "护栏: 权限快照摘要不可得"; rm -f "$plain"; return 1; }
     # 条数必须对得上，否则说明有文件被跳过（xargs 遇错会继续处理其余批次）
     # want 取自**计数器**而非文件——文件被截断时它自己数自己永远相符（R20 #1）
     local want got
@@ -851,7 +1424,11 @@ _prot_hash() {
       log "护栏: 批量哈希条数不符（期望 ${want} 实得 ${got}），失败关闭"
       rm -f "$plain"; return 1
     fi
-    h="${h}${bulk}"$'\n'
+    if [ "$want" != "$mode_n" ]; then
+      log "护栏: 权限快照条数不符（期望 ${want} 实得 ${mode_n}），失败关闭"
+      rm -f "$plain"; return 1
+    fi
+    h="${h}MODESET ${mode_n} ${mode_digest}"$'\n'"${bulk}"$'\n'
   fi
   rm -f "$plain"
   printf '%s' "$h"
@@ -873,9 +1450,13 @@ PROT_BACKUP_MAX_BYTES="${SLEEP_WELL_BACKUP_MAX_BYTES:-10485760}"
 # 备份单个绝对路径。已跟踪→跳过（git 兜底）；超限→跳过并记日志；失败→记日志。
 # 返回 0 表示确实产生了备份（调用方据此计数——之前 cli 失败时 exit 0，计数是假的）。
 _backup_one() {
-  local repo="$1" abs="$2" root="$3" day="$4" rel sz
-  rel="${abs#"$repo"/}"
-  git -C "$repo" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 && return 1
+  local repo="$1" abs="$2" root="$3" day="$4" rel="$5" sz
+  case "$rel" in
+    ''|/*|..|../*) log "⚠️ 备份路径无法映射到仓库内相对路径: ${abs}"; return 1 ;;
+  esac
+  # `rel` is a filename, not a pathspec. Without literal magic, a name such as
+  # `*.pem` can match an unrelated tracked PEM and be mistaken for tracked.
+  git -C "$repo" ls-files --error-unmatch -- ":(literal)$rel" >/dev/null 2>&1 && return 1
   sz="$(stat -f '%z' "$abs" 2>/dev/null)" || return 1
   if [ "$sz" -gt "$PROT_BACKUP_MAX_BYTES" ]; then
     # 超限要让用户知道（R15 #6: 文档已声称会告警而这支原来只 log），但**推送要聚合**
@@ -905,20 +1486,26 @@ _backup_one() {
 BACKUP_SKIPPED_N=0
 BACKUP_FAILED_N=0
 _backup_untracked_protected() {
-  local repo="$1" listf="$2" p sz n=0
+  local repo="$1" listf="$2" p sz n=0 scan_n=0
   BACKUP_SKIPPED_N=0; BACKUP_FAILED_N=0
-  local root="$CODEX_HOME/backups" day; day="$(date '+%Y-%m-%d')"
+  local root="$SW_RUNTIME_HOME/backups" day; day="$(date '+%Y-%m-%d')"
   # 上限值本身要校验（Codex R12 #9）: 非数值时整数比较失败、超大文件反而照备；
   # 负值则每个文件都跳过。两种都让「有界」这个承诺落空且无人知晓。
-  case "$PROT_BACKUP_MAX_BYTES" in
-    ''|*[!0-9]*) log "⚠️ SLEEP_WELL_BACKUP_MAX_BYTES 非法，回落 10485760"; PROT_BACKUP_MAX_BYTES=10485760 ;;
-  esac
+  if PROT_BACKUP_MAX_BYTES="$(normalize_decimal "$PROT_BACKUP_MAX_BYTES")" \
+     && [ "${#PROT_BACKUP_MAX_BYTES}" -le 18 ]; then
+    :
+  else
+    log "⚠️ SLEEP_WELL_BACKUP_MAX_BYTES 非法，回落 10485760"
+    PROT_BACKUP_MAX_BYTES=10485760
+  fi
   [ "$PROT_BACKUP_MAX_BYTES" -lt 1024 ] && PROT_BACKUP_MAX_BYTES=1024
 
-  local tgt real_repo
+  local tgt real_repo rel
   real_repo="$(cd "$repo" && pwd -P)" || return 0
   while IFS= read -r -d '' p; do
     [ -z "$p" ] && continue
+    scan_n=$((scan_n + 1))
+    [ $((scan_n % 20)) -eq 0 ] && beat
     if [ -L "$repo/$p" ]; then
       # ⚠️ 不能一律跳过链接（Codex R12 #3）: `.env -> config/runtime` 时护栏会跟随并
       #    保护 target，但 target 自身的路径不受保护、也进不了这个清单——
@@ -927,11 +1514,12 @@ _backup_untracked_protected() {
       tgt="$(realpath "$repo/$p" 2>/dev/null)" || continue
       case "$tgt" in "$real_repo"|"$real_repo"/*) : ;; *) continue ;; esac   # 仓库外不碰
       [ -f "$tgt" ] || continue
-      _backup_one "$repo" "$tgt" "$root" "$day" && n=$((n+1))
+      rel="${tgt#"$real_repo"/}"
+      _backup_one "$repo" "$repo/$rel" "$root" "$day" "$rel" && n=$((n+1))
       continue
     fi
     [ -f "$repo/$p" ] || continue
-    _backup_one "$repo" "$repo/$p" "$root" "$day" && n=$((n+1))
+    _backup_one "$repo" "$repo/$p" "$root" "$day" "$p" && n=$((n+1))
   done <"$listf"
   [ "$n" -gt 0 ] && log "已备份 ${n} 份未跟踪的受保护文件"
   # 聚合成一条推送（Codex R16 #4）: 逐文件 push 会 N×10 秒 + 刷屏。
@@ -942,21 +1530,40 @@ _backup_untracked_protected() {
   return 0
 }
 
+guard_branch_identity() {
+  local repo="$1" current
+  current="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>>"$RUNLOG")" && {
+    printf '%s' "$current"
+    return 0
+  }
+  current="$(git -C "$repo" rev-parse --verify HEAD 2>>"$RUNLOG")" || return 1
+  printf '%s' "$current"
+}
+
 guard_snapshot() {
   local repo="$1"
+  GUARD_ABORT_REASON="护栏不可得"
+  beat
   GUARD_HEAD="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || { log "护栏快照失败: rev-parse"; return 1; }
   # 所有本地分支的位置——squash/ff merge 不产生提交，但会动 ref 或暂存区
   GUARD_REFS="$(git -C "$repo" for-each-ref refs/heads 2>/dev/null)" || { log "护栏快照失败: for-each-ref"; return 1; }
+  guard_git_meta_snapshot "$repo" || return 1
   local plist; plist="$(mktemp)" || { log "护栏快照失败: mktemp"; return 1; }
   GUARD_PROT="$(PROT_LIST_OUT="$plist" _prot_hash "$repo")" || {
     rm -f "$plist"; log "护栏快照失败: 受保护路径哈希"; return 1; }
+  beat
   _backup_untracked_protected "$repo" "$plist"
+  beat
   rm -f "$plist"
   return 0
 }
 
 guard_verify() {
   local repo="$1"
+  GUARD_ABORT_REASON="护栏不可得"
+  # Must be the first verification step: every later Git command may honor
+  # repository config, fsmonitor or hooks that an AI process tried to install.
+  guard_git_meta_verify "$repo" || return 1
   # ① Codex 回合内不得有新提交（覆盖普通 merge 与野生 commit）
   # rev-list 失败（坏 sha、仓库损坏）会让 wc -l 得到 0 → 被当成「没有新提交」而放行。
   # 必须先判命令本身成功（Codex R3 #6）。
@@ -964,6 +1571,7 @@ guard_verify() {
     log "护栏核验失败: rev-list 出错"; push "🚨 护栏核验失败" "无法核验提交，夜班已中止"; return 1; }
   local n; n="$(printf '%s' "$rl" | grep -c . || true)"
   if [ "${n:-0}" -gt 0 ]; then
+    GUARD_ABORT_REASON="护栏违规"
     log "护栏违规: Codex 回合内出现 ${n} 个新提交"; push "🚨 护栏违规" "检出未授权提交，夜班已中止"; return 1
   fi
   # ② squash / ff merge 不产生提交（Codex R2 #3，我已复现: --squash 后新提交数为 0
@@ -973,12 +1581,18 @@ guard_verify() {
   case "$gd" in /*) : ;; *) gd="$repo/$gd" ;; esac
   for m in SQUASH_MSG MERGE_HEAD MERGE_MSG; do
     if [ -e "$gd/$m" ]; then
+      GUARD_ABORT_REASON="护栏违规"
       log "护栏违规: 检出 .git/${m}（squash 或未完成的 merge）"
       push "🚨 护栏违规" "检出 merge 痕迹，夜班已中止"; return 1
     fi
   done
-  local br_now; br_now="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$repo" rev-parse HEAD 2>/dev/null)"
+  local br_now; br_now="$(guard_branch_identity "$repo")" || {
+    log "护栏核验失败: 无法核验当前分支"
+    push "🚨 护栏核验失败" "无法核验当前分支，夜班已中止"
+    return 1
+  }
   if [ "$br_now" != "$GUARD_BRANCH" ]; then
+    GUARD_ABORT_REASON="护栏违规"
     log "护栏违规: 当前分支由 ${GUARD_BRANCH} 变为 ${br_now}"
     push "🚨 护栏违规" "检出分支切换，夜班已中止"; return 1
   fi
@@ -989,12 +1603,14 @@ guard_verify() {
   refs_now="$(git -C "$repo" for-each-ref refs/heads 2>>"$RUNLOG")" || {
     log "护栏核验失败: for-each-ref 出错"; push "🚨 护栏核验失败" "无法核验分支引用，夜班已中止"; return 1; }
   if [ "$refs_now" != "$GUARD_REFS" ]; then
+    GUARD_ABORT_REASON="护栏违规"
     log "护栏违规: 本地分支引用发生变化（ff-merge / reset / 建删分支）"
     push "🚨 护栏违规" "检出分支引用变动，夜班已中止"; return 1
   fi
   # ③ 受保护路径内容
   local prot_now; prot_now="$(_prot_hash "$repo")" || { log "护栏核验失败: 受保护路径哈希不可得"; push "🚨 护栏核验失败" "无法核验受保护文件，夜班已中止"; return 1; }
   if [ "$prot_now" != "$GUARD_PROT" ]; then
+    GUARD_ABORT_REASON="护栏违规"
     log "护栏违规: 受保护路径内容变化"; push "🚨 护栏违规" "受保护文件被修改，夜班已中止"; return 1
   fi
   return 0
@@ -1007,11 +1623,11 @@ guard_verify() {
 # 有效做法是给夜班一个干净的 CODEX_HOME: 自带极简 config.toml、无任何 MCP/插件，
 # auth.json 软链回真实 home 以保留登录。实测该 home 下 `codex mcp list` 输出
 # 「No MCP servers configured yet」。
-# 这很重要: 用户的 node_repl 与 github（带 PAT）两个 MCP 是 enabled 状态，
-# 无人值守时它们就是现成的外带与 push 通道。
-SW_CODEX_HOME="$CODEX_HOME_OVERRIDE"
+# 这很重要：已有用户配置可能启用了带凭据或外部写权限的 MCP；
+# 无人值守时它们会扩大外带与外部副作用面。
+SW_CODEX_HOME=""
 prepare_codex_home() {
-  SW_CODEX_HOME="$CODEX_HOME/codex-home"
+  SW_CODEX_HOME="$SW_RUNTIME_HOME/codex-home"
   mkdir -p "$SW_CODEX_HOME" || return 1
   cat >"$SW_CODEX_HOME/config.toml" <<'TOML'
 # sleep-well-codex 专用的极简 Codex 配置——刻意不含任何 mcp_servers / plugins。
@@ -1055,7 +1671,15 @@ remote_plugin = false
 plugin_sharing = false
 multi_agent = false
 TOML
-  ln -sfn "$HOME/.codex/auth.json" "$SW_CODEX_HOME/auth.json" || return 1
+  if [ ! -r "$SW_USER_CODEX_HOME/auth.json" ]; then
+    log "⚠️ 未找到可读的 Codex 登录态: ${SW_USER_CODEX_HOME}/auth.json"
+    return 1
+  fi
+  ln -sfn "$SW_USER_CODEX_HOME/auth.json" "$SW_CODEX_HOME/auth.json" || return 1
+  [ -r "$SW_CODEX_HOME/auth.json" ] || {
+    log "⚠️ 隔离 CODEX_HOME 的登录态链接不可读，拒绝开工"
+    return 1
+  }
   # 自检: 确认该 home 下确实没有 MCP。**探测本身失败也要拒绝开工**（Codex R5 #7）——
   # 原写法只看 grep 结果，探测命令出错时输出为空，反而被当成「没有 MCP」放行。
   # ⚠️ 诊断必须说实话（2026-08-16 实测教训）: 这条原来无论什么原因失败都报
@@ -1064,14 +1688,12 @@ TOML
   #    先分开判「命令在不在」与「输出对不对」。
   if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
     log "⚠️ 找不到 codex 可执行文件（PATH=${PATH}），拒绝开工"
-    push "⚠️ 夜班未开工" "找不到 codex 命令，请检查 PATH"
     return 1
   fi
   local probe probe_rc
   probe="$(CODEX_HOME="$SW_CODEX_HOME" "$CODEX_BIN" mcp list 2>&1)"; probe_rc=$?
   if [ "$probe_rc" -ne 0 ]; then
     log "⚠️ codex mcp list 退出码 ${probe_rc}，拒绝开工: $(printf '%.200s' "$probe")"
-    push "⚠️ 夜班未开工" "MCP 自检命令失败（退出码 ${probe_rc}）"
     return 1
   fi
   # ⚠️ 不能写成 `printf ... | grep -q ...`（R8 自查，已实测）: 脚本开了 set -o pipefail，
@@ -1142,28 +1764,66 @@ run_with_timeout() {
 _run_codex_inner() {
   local repo="$1" body="$2" outfile="$3"
   # </dev/null 是必须的，不是防御性写法: 没有它，stdin 不是 /dev/null 时 codex 会永久阻塞。
-  ( cd "$repo" && CODEX_HOME="$SW_CODEX_HOME" "$CODEX_BIN" exec --skip-git-repo-check \
+  ( cd "$repo" && umask 022 && CODEX_HOME="$SW_CODEX_HOME" "$CODEX_BIN" exec --skip-git-repo-check \
       -s workspace-write -c sandbox_workspace_write.network_access=false \
       "$body" ) </dev/null >"$outfile" 2>&1
 }
 
+_run_cli_snapshot_inner() {
+  node "$CLI" "$1" "$2" >"$3" 2>>"$RUNLOG"
+}
+bounded_cli_snapshot() {
+  local kind="$1" repo="$2" tmp rc
+  tmp="$(mktemp "$STATE_DIR/${kind}.XXXXXX")" || return 1
+  run_with_timeout "$AI_TIMEOUT_SECS" _run_cli_snapshot_inner "$kind" "$repo" "$tmp"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then cat "$tmp"; fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
 # 统一的「调用 codex 并处置结果」（Codex R14 #1 推荐）: 三个调用点各写一遍的结果是
 # 我 R13 只修了两处、**又漏掉普通修复路径**，护栏洞在同一轮里没修干净。
-# 约定: 返回 0=成功（已写恢复证据、已过护栏核验）; 2=该侧不可用; 3=护栏违规。
+# 约定: 返回 0=成功（已写恢复证据、已过护栏核验）; 2=该侧不可用;
+# 3=护栏中止（GUARD_ABORT_REASON 区分违规与不可得）。
 codex_step() {
   local repo="$1" body="$2" outfile="$3" id="$4" what="$5"
+  local reserved_before_json reserved_before reserved_after_json reserved_after
+  if ! reserved_before_json="$(bounded_cli_snapshot review-content-snapshot "$repo")" \
+     || ! reserved_before="$(jq_get "$reserved_before_json" digest)"; then
+    GUARD_ABORT_REASON="护栏不可得"
+    log "[$id] 无法建立 .review 保留区快照，失败关闭"
+    return 3
+  fi
   run_codex "$repo" "$body" "$outfile"
   local rc=$? kind
+  # This must precede even the .review snapshot, because that snapshot invokes
+  # Git and a modified config could activate fsmonitor/filter commands.
+  guard_git_meta_verify "$repo" || return 3
+  if ! reserved_after_json="$(bounded_cli_snapshot review-content-snapshot "$repo")" \
+     || ! reserved_after="$(jq_get "$reserved_after_json" digest)"; then
+    GUARD_ABORT_REASON="护栏不可得"
+    log "[$id] 无法核验 .review 保留区，失败关闭"
+    return 3
+  fi
+  if [ "$reserved_after" != "$reserved_before" ]; then
+    GUARD_ABORT_REASON="护栏违规"
+    log "[$id] 护栏违规: 实现者修改了 .review 保留区"
+    push "🚨 护栏违规" "实现者修改了审查保留区，夜班已中止"
+    return 3
+  fi
   kind="$(jq_get "$(node "$CLI" classify "$outfile" "$rc" codex)" kind || echo other)"
   if [ "$kind" != ok ]; then
     log "[$id] ${what}codex 不可用: ${kind}"
     # ⚠️ 失败也要核验（R13 符合性扫查）: codex 可能在失败前已经动过受保护文件，
     #    那份改动没人检出，下一跳 guard_snapshot 会把它当成新基线，从此再也发现不了。
     if ! guard_verify "$repo"; then
-      node "$CLI" availability-set codex "$kind" >/dev/null 2>&1
       return 3
     fi
-    node "$CLI" availability-set codex "$kind" >/dev/null 2>&1
+    node "$CLI" availability-set codex "$kind" >/dev/null 2>>"$RUNLOG" || {
+      log "[$id] codex 不可用状态写入失败"
+      return 4
+    }
     return 2
   fi
   # ⚠️ **护栏核验必须排在一切之前**（Codex R15 #1，他实测复现）: 我 R14 为了不吞掉
@@ -1189,8 +1849,8 @@ run_codex() {
   #   -s workspace-write            → 仓库内可写、仓库外写入被拒
   #   network_access=false          → 无网络，任何 remote push 不可能
   # 用户全局 config.toml 里 network_access=true，此处逐次覆盖。
-  #   -c mcp_servers={} -c plugins={}  → 无人值守时清空用户的 MCP 与插件（Codex R3 #1）。
-  #   否则夜班会带着 figma/notion/computer-use/node_repl 等一起跑，副作用面远大于仓库。
+  # MCP/插件隔离由 prepare_codex_home 创建的独立 CODEX_HOME 保证；命令行
+  # `-c mcp_servers={}` 实测无效，不能把它描述成第二道隔离机制。
   # ⚠️ **读取边界未受约束**（Codex R3 #2，已实测）: workspace-write 挡写不挡读，
   #   Codex 能 cat 仓库外任意可读文件并经输出通道带出。已列入 SKILL.md 已知限制。
   run_with_timeout "$AI_TIMEOUT_SECS" _run_codex_inner "$repo" "$body" "$outfile"
@@ -1200,19 +1860,156 @@ run_codex() {
 }
 
 # ── 单个任务 ──────────────────────────────────────────────────────────
-# 返回 0=本任务告一段落  2=可用性问题（主循环按 decideHop 处置）  3=护栏违规（中止整夜）
+# Persist a terminal human-review state from any live task state. Reading the
+# current value avoids relying on _process_task_inner's stale `status` argument
+# after one or more transitions. A write failure is an internal fault, never a
+# successful task outcome.
+mark_task_needs_human() {
+  local id="$1" current
+  current="$(node "$CLI" get-field "$id" status 2>>"$RUNLOG")" || {
+    log "[$id] 无法读取任务状态，不能可靠转人工"
+    return 1
+  }
+  [ "$current" = needs_human ] && return 0
+  if [ "$current" = pending ]; then
+    node "$CLI" advance "$id" implementing >/dev/null 2>>"$RUNLOG" || {
+      log "[$id] pending → implementing 状态写入失败"
+      return 1
+    }
+  fi
+  node "$CLI" advance "$id" needs_human >/dev/null 2>>"$RUNLOG" || {
+    log "[$id] 转 needs_human 状态写入失败"
+    return 1
+  }
+}
+
+# Advance exactly this task to reviewing. `next-task` is not a status lookup:
+# after a concurrent/state failure it may select a different reviewing task.
+ensure_task_reviewing() {
+  local id="$1" current
+  node "$CLI" advance "$id" reviewing >/dev/null 2>>"$RUNLOG" && return 0
+  current="$(node "$CLI" get-field "$id" status 2>>"$RUNLOG")" || {
+    log "[$id] 无法读取本任务状态，不能确认 reviewing"
+    return 1
+  }
+  [ "$current" = reviewing ] || {
+    log "[$id] 无法转入 reviewing（当前状态: ${current}）"
+    return 1
+  }
+}
+
+# 返回 0=本任务告一段落  2=可用性问题（主循环按 decideHop 处置）
+#      3=护栏中止（GUARD_ABORT_REASON 区分违规与不可得）
+#      4=内部状态故障（立即 hop_fail）
 # 包装: 保证任何退出路径都恢复用户原有的 pre-push hook
 process_task() {
   local rc
   _process_task_inner "$@"; rc=$?
   # hook 清理失败一律中止整夜（Codex R6 #3）: 保留 rc=2 会让下一跳继续跑并覆盖
   # 恢复状态，用户原有的 hook 就永久丢了。
-  guard_uninstall || { log "⚠️ hook 恢复失败——升级为护栏中止"; rc=3; }
+  guard_uninstall || {
+    log "⚠️ hook 恢复失败——升级为护栏中止"
+    GUARD_ABORT_REASON="pre-push hook 未能恢复"
+    rc=3
+  }
   return $rc
 }
+
+# A checkpoint must never commit review-adapter artifacts. Excluding .review
+# from `git add` is insufficient because a plain `git commit` submits every
+# entry already present in the index. The review content snapshot catches an
+# adapter that staged .review; this is the final fail-closed boundary directly
+# before every checkpoint.
+checkpoint_commit() {
+  local repo="$1" message="$2" staged_review
+  guard_git_meta_verify "$repo" || return 3
+  staged_review="$(git -C "$repo" ls-files -- .review 2>>"$RUNLOG")" || {
+    GUARD_ABORT_REASON="护栏不可得"
+    log "checkpoint 前无法核验 .review 索引，拒绝提交"
+    push "🚨 护栏核验失败" "checkpoint 前无法核验 .review 索引，夜班已中止"
+    return 3
+  }
+  if [ -n "$staged_review" ]; then
+    GUARD_ABORT_REASON="护栏违规"
+    log "checkpoint 拒绝: .review/ 已进入 Git 索引"
+    push "🚨 护栏违规" "checkpoint 前检出 .review 已暂存，夜班已中止"
+    return 3
+  fi
+  # The metadata digest is the observable fail-closed boundary. Disable hooks
+  # as an additional execution-time barrier for the checkpoint itself.
+  ( cd "$repo" \
+    && git -c core.hooksPath=/dev/null add -A -- . ':(exclude).review' \
+    && git -c core.hooksPath=/dev/null commit --no-verify -q -m "$message" ) 2>>"$RUNLOG"
+}
+
+load_constraint_prompt() {
+  local name="$1" path="$SKILL_DIR/prompts/$1"
+  if [ ! -r "$path" ] || [ ! -s "$path" ]; then
+    log "约束提示词缺失、为空或不可读: prompts/${name}"
+    return 1
+  fi
+  cat "$path" 2>>"$RUNLOG" || {
+    log "读取约束提示词失败: prompts/${name}"
+    return 1
+  }
+}
+
+# The current metadata guard intentionally covers one complete repository
+# worktree. Nested gitdirs, other linked worktrees, and local config includes
+# introduce mutable Git configuration outside that frozen path set. Reject
+# those shapes before any AI call until they have their own audited enumerator.
+UNATTENDED_SHAPE_REASON=""
+check_unattended_repo_shape() {
+  local repo="$1" staged gitlinks worktrees worktree_n hooks_path hooks_rc worktree_cfg worktree_cfg_rc includes include_rc
+  staged="$(git -C "$repo" ls-files --stage 2>>"$RUNLOG")" || return 2
+  gitlinks="$(printf '%s\n' "$staged" | awk '$1 == "160000" { n++ } END { print n + 0 }')" || return 2
+  if [ "$gitlinks" -gt 0 ]; then
+    UNATTENDED_SHAPE_REASON="仓库含子模块 gitlink"
+    return 1
+  fi
+
+  worktrees="$(git -C "$repo" worktree list --porcelain 2>>"$RUNLOG")" || return 2
+  worktree_n="$(printf '%s\n' "$worktrees" | awk '$1 == "worktree" { n++ } END { print n + 0 }')" || return 2
+  if [ "$worktree_n" -gt 1 ]; then
+    UNATTENDED_SHAPE_REASON="仓库关联了其它 linked worktree"
+    return 1
+  fi
+
+  hooks_path="$(git -C "$repo" config --path --get core.hooksPath 2>>"$RUNLOG")"
+  hooks_rc=$?
+  if [ "$hooks_rc" -eq 0 ] && [ -n "$hooks_path" ]; then
+    UNATTENDED_SHAPE_REASON="仓库使用自定义 core.hooksPath"
+    return 1
+  fi
+  [ "$hooks_rc" -eq 1 ] || return 2
+
+  worktree_cfg="$(git -C "$repo" config --local --type=bool --get extensions.worktreeConfig 2>>"$RUNLOG")"
+  worktree_cfg_rc=$?
+  if [ "$worktree_cfg_rc" -eq 0 ] && [ "$worktree_cfg" = true ]; then
+    UNATTENDED_SHAPE_REASON="仓库启用了 extensions.worktreeConfig"
+    return 1
+  fi
+  [ "$worktree_cfg_rc" -eq 0 ] || [ "$worktree_cfg_rc" -eq 1 ] || return 2
+
+  includes="$(git -C "$repo" config --local --get-regexp '^include.*\.path$' 2>>"$RUNLOG")"
+  include_rc=$?
+  if [ "$include_rc" -eq 0 ] && [ -n "$includes" ]; then
+    UNATTENDED_SHAPE_REASON="仓库本地 Git 配置使用 include.path/includeIf"
+    return 1
+  fi
+  [ "$include_rc" -eq 1 ] || return 2
+  return 0
+}
+
 _process_task_inner() {
   local id="$1" repo="$2" status="$3" prompt="$4" title="$5"
   local ts; ts="$(date '+%H%M%S')"
+  if [ -z "$repo" ]; then
+    log "[$id] repo 为空，拒绝在编排器当前目录执行任务"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: queue 任务缺少 repo"
+    return 0
+  fi
   # id 保留原样（可能是中文或含空格——queue.md 是用户手写且与 Claude 侧共享的），
   # 只对**派生的文件名**做编码（Codex R16 #2 推荐的方案）。
   # 加 8 位哈希后缀防止 `a b` 与 `a-b` 编码后撞名。
@@ -1222,24 +2019,69 @@ _process_task_inner() {
   local sid
   if ! sid="$(safe_id "$id")"; then
     log "[$id] 无法派生安全文件名（shasum 不可用），转人工"
-    [ "$status" = pending ] && node "$CLI" advance "$id" implementing >/dev/null 2>&1
-    node "$CLI" advance "$id" needs_human >/dev/null 2>&1 \
-      || log "[$id] ⚠️ 转人工失败，任务状态可能不一致"
+    mark_task_needs_human "$id" || return 4
     push "⚠️ 需要拍板" "${title}: 无法派生安全文件名"
     return 2
   fi
   local co="$LOG_DIR/${sid}-${ts}.codex.out" ro="$LOG_DIR/${sid}-${ts}.review.out" re="$LOG_DIR/${sid}-${ts}.review.err"
+  local repair_evidence="$LOG_DIR/${sid}-${ts}.findings.md"
 
-  # .git 可以是**文件**（git worktree / submodule 的 gitlink）——只判目录会拒掉合法工作树
+  # .git 可以是**文件**，所以仓库识别不能只判目录；下方会在独立的
+  # unattended-shape 门禁中拒绝尚未覆盖元数据面的 linked worktree / submodule。
   if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     # pending → needs_human 是非法转换（state.mjs 的 LEGAL 只允许 pending→implementing|skipped）；
     # 原实现直接跳，CLI 报错被吞、函数还返回 0，同一任务被主循环反复选中（Codex R1 #16）。
     log "[$id] repo 不是 git 仓库: ${repo}"
-    [ "$status" = pending ] && node "$CLI" advance "$id" implementing >/dev/null 2>&1
-    node "$CLI" advance "$id" needs_human >/dev/null 2>&1 || {
-      log "[$id] 无法标 needs_human，改标 skipped 以免死循环"
-      node "$CLI" advance "$id" skipped >/dev/null 2>&1; }
+    mark_task_needs_human "$id" || return 4
     push "⚠️ 需要拍板" "${title}: repo 不是 git 仓库"
+    return 0
+  fi
+
+  # All baseline, protected-path and checkpoint operations are defined over a
+  # complete repository. A subdirectory silently narrows pathspec `.` while
+  # `git commit` still consumes the whole index, so reject it rather than mix
+  # scopes. Canonical paths keep a symlink that resolves to the root valid.
+  local repo_top repo_real
+  repo_top="$(git -C "$repo" rev-parse --show-toplevel 2>>"$RUNLOG")" || repo_top=""
+  [ -z "$repo_top" ] || repo_top="$(cd "$repo_top" 2>/dev/null && pwd -P)"
+  repo_real="$(cd "$repo" 2>/dev/null && pwd -P)" || repo_real=""
+  if [ -z "$repo_top" ] || [ "$repo_real" != "$repo_top" ]; then
+    log "[$id] repo 必须是 Git 仓库顶层目录: ${repo}"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: repo 必须是 Git 仓库顶层目录"
+    return 0
+  fi
+  repo="$repo_top"
+
+  check_unattended_repo_shape "$repo"
+  local shape_rc=$?
+  if [ "$shape_rc" -eq 1 ]; then
+    log "[$id] ${UNATTENDED_SHAPE_REASON}；当前元数据护栏不覆盖，拒绝无人值守"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: ${UNATTENDED_SHAPE_REASON}，暂不支持无人值守"
+    return 0
+  elif [ "$shape_rc" -ne 0 ]; then
+    log "[$id] 无法核验仓库 Git 元数据拓扑 → 转人工"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: 无法核验仓库 Git 元数据拓扑"
+    return 0
+  fi
+
+  # `.review/` is reserved for review-adapter output and is excluded from
+  # baselines, protected snapshots and checkpoint commits. If the target
+  # repository tracks that namespace itself, unattended operation would hide
+  # real project changes. Refuse the task before installing hooks or invoking AI.
+  local tracked_review
+  tracked_review="$(git -C "$repo" ls-files -- .review 2>>"$RUNLOG")" || {
+    log "[$id] 无法检查保留的 .review 命名空间 → 转人工"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: 无法检查 .review 保留命名空间"
+    return 0
+  }
+  if [ -n "$tracked_review" ]; then
+    log "[$id] 目标仓库已跟踪 .review/；该路径是编排器保留命名空间，拒绝无人值守"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: 仓库使用了保留的 .review/ 路径"
     return 0
   fi
 
@@ -1247,23 +2089,35 @@ _process_task_inner() {
   # 本任务结束时的 `git add -A` 会把它们一并提交进 checkpoint。开工前即拒绝。
   # 只在**开工那一刻**要求；任务自身产生的 dirty 由 nextTask 的同仓库串行保证不混。
   if [ "$status" = pending ]; then
-    local base_st; base_st="$(git -C "$repo" status --porcelain 2>>"$RUNLOG")" || {
-      log "[$id] 无法读取基线状态 → 转人工（不猜）"; 
-      node "$CLI" advance "$id" implementing >/dev/null 2>&1
-      node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+    local base_st; base_st="$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>>"$RUNLOG")" || {
+      log "[$id] 无法读取基线状态 → 转人工（不猜）";
+      mark_task_needs_human "$id" || return 4
       push "⚠️ 需要拍板" "${title}: 无法读取仓库状态"; return 0; }
     if [ -n "$base_st" ]; then
       log "[$id] 仓库有既存未提交改动，拒绝开工（避免把你的工作混进 checkpoint）:"
       printf '%s\n' "$base_st" | head -10 | sed 's/^/    | /' >>"$RUNLOG"
-      node "$CLI" advance "$id" implementing >/dev/null 2>&1
-      node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+      mark_task_needs_human "$id" || return 4
       push "⚠️ 需要拍板" "${title}: 仓库有既存未提交改动，未开工"
       return 0
     fi
   fi
 
+  # An unborn repository has no checkpoint baseline. Treat it as a task-local
+  # precondition requiring a human bootstrap commit, not as a fabricated guard
+  # violation that aborts every later task in the night.
+  if ! git -C "$repo" rev-parse --verify HEAD >/dev/null 2>&1; then
+    log "[$id] repo 尚无可用的 HEAD 提交，无法建立 checkpoint 基线 → 转人工"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: repo 尚无 HEAD 提交，请先建立初始 checkpoint 基线"
+    return 0
+  fi
+
   # 记录原始分支（Codex R4 #4）: Codex 若切了分支，后续 checkpoint 会提交到错误分支上
-  GUARD_BRANCH="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$repo" rev-parse HEAD 2>/dev/null)"
+  GUARD_BRANCH="$(guard_branch_identity "$repo")" || {
+    log "[$id] 无法捕获当前分支身份 → 护栏不可得"
+    return 3
+  }
+  GUARD_ABORT_REASON="护栏不可得"
   guard_install "$repo" || { log "[$id] 护栏安装失败"; return 3; }
   guard_snapshot "$repo" || { guard_uninstall; log "[$id] 护栏快照失败"; return 3; }
 
@@ -1271,32 +2125,50 @@ _process_task_inner() {
   #    fixing 与 reviewing 都**不能**重跑 implement prompt（Codex R1 #9: 原实现在
   #    fixing 状态下会用原任务提示词再实现一遍，每个非零 findings 轮都发生）。
   if [ "$status" = pending ] || [ "$status" = implementing ]; then
-    [ "$status" = pending ] && node "$CLI" advance "$id" implementing >/dev/null
+    if [ "$status" = pending ]; then
+      node "$CLI" advance "$id" implementing >/dev/null 2>>"$RUNLOG" || {
+        log "[$id] pending → implementing 状态写入失败"
+        return 4
+      }
+    fi
     log "[$id] 实现开始"
-    codex_step "$repo" "$(printf '%s\n\n%s\n' "$prompt" "$(cat "$SKILL_DIR/prompts/implement.md")")" \
+    local implement_rules
+    implement_rules="$(load_constraint_prompt implement.md)" || {
+      GUARD_ABORT_REASON="约束提示词不可得"
+      log "[$id] 无法读取实现约束，拒绝调用 Codex"
+      return 3
+    }
+    codex_step "$repo" "$(printf '%s\n\n%s\n' "$prompt" "$implement_rules")" \
                "$co" "$id" ""
     local crc=$?; [ "$crc" -ne 0 ] && return "$crc"
-    node "$CLI" advance "$id" reviewing >/dev/null
+    ensure_task_reviewing "$id" || return 4
   elif [ "$status" = fixing ]; then
     # 从 fixing 恢复 = 上一跳的修复轮因可用性问题中断，修复**没做完**。
     # 直接转 reviewing 会拿未修的 diff 再审一轮，findings 数不降 → decideNext 判 stall
     # → 把一次临时故障升级成 needs_human（Codex R3 #9）。故重跑修复提示。
     log "[$id] 从中断的修复轮恢复，重跑修复"
     local lastff; lastff="$(node "$CLI" get-field "$id" lastFindingsFile 2>/dev/null || echo '')"
-    codex_step "$repo" "$(printf '继续修复上一轮审查发现的问题（上次修复被中断）。%s\n\n%s\n' \
-                          "${lastff:+ findings 详见 ${lastff} 的「Findings」节。}" \
-                          "$(cat "$SKILL_DIR/prompts/fix.md")")" "$co" "$id" "恢复修复时 "
+    if [ -z "$lastff" ] || [ ! -f "$lastff" ] || ! cp "$lastff" "$repair_evidence"; then
+      log "[$id] 上轮 findings 证据缺失，无法安全恢复修复轮"
+      mark_task_needs_human "$id" || return 4
+      return 0
+    fi
+    local resume_fix_rules
+    resume_fix_rules="$(load_constraint_prompt fix.md)" || {
+      GUARD_ABORT_REASON="约束提示词不可得"
+      log "[$id] 无法读取修复约束，拒绝调用 Codex"
+      return 3
+    }
+    codex_step "$repo" "$(printf '原始任务范围（唯一任务授权）:\n%s\n\n继续修复上一轮审查发现的问题（上次修复被中断）。%s\n\n%s\n' \
+                          "$prompt" " findings 详见 ${repair_evidence} 的「Findings」节。" \
+                          "$resume_fix_rules")" "$co" "$id" "恢复修复时 "
     local crc2=$?; [ "$crc2" -ne 0 ] && return "$crc2"
-    node "$CLI" advance "$id" reviewing >/dev/null
+    ensure_task_reviewing "$id" || return 4
   fi
 
   # 2. 审查（**不 commit**——审查必须看未提交的 diff）
   # 状态写不进去就不能继续（Codex R5 #9）: 否则崩溃后从旧状态恢复会重跑实现
-  node "$CLI" advance "$id" reviewing >/dev/null 2>&1 || {
-    if [ "$(jq_get "$(node "$CLI" next-task)" task.status || echo '')" != reviewing ]; then
-      log "[$id] 无法转入 reviewing，停止本任务"; return 2
-    fi
-  }
+  ensure_task_reviewing "$id" || return 4
   # defer-review: claude 已知不可用，不必再打一次注定失败的调用——直接挂起
   if [ "${HOP_MODE:-work}" = defer-review ]; then
     log "[$id] claude 不可用，跳过本轮审查并挂起（下一跳重试）"
@@ -1305,42 +2177,136 @@ _process_task_inner() {
     return 0
   fi
   log "[$id] 审查开始"
+  # This is the sole production definition of the reviewer argv contract.
+  # Keep it in sync with README "Required reviewer"; the E2E fake records and
+  # asserts the exact argv so changes here cannot drift behind a dead helper.
   _run_review_inner() { "$REVIEW_SH" -C "$1" --uncommitted -t decision </dev/null >"$2" 2>"$3"; }
+  local review_before_json review_before
+  if ! review_before_json="$(bounded_cli_snapshot repo-content-snapshot "$repo")" \
+     || ! review_before="$(jq_get "$review_before_json" digest)"; then
+    GUARD_ABORT_REASON="护栏不可得"
+    log "[$id] 无法建立审查器只读快照，失败关闭"
+    push "🚨 护栏核验失败" "无法建立审查前内容快照，夜班已中止"
+    return 3
+  fi
   run_with_timeout "$AI_TIMEOUT_SECS" _run_review_inner "$repo" "$ro" "$re"
   local rcode=$?
-  # 超时按「不可用/原因不明」处理，绝不当成零 findings 通过（失败关闭契约）
-  [ "$rcode" -eq 124 ] && log "[$id] 审查超时 ${AI_TIMEOUT_SECS}s，已终止"
+  # The reviewer runs outside the Codex sandbox. Once it has run, verify its
+  # side effects before interpreting *any* outcome, including timeout,
+  # unavailability, malformed output and findings-integrity failure.
+  guard_verify "$repo" || return 3
+  local review_after_json review_after
+  if ! review_after_json="$(bounded_cli_snapshot repo-content-snapshot "$repo")" \
+     || ! review_after="$(jq_get "$review_after_json" digest)"; then
+    GUARD_ABORT_REASON="护栏不可得"
+    log "[$id] 无法建立审查后内容快照，失败关闭"
+    push "🚨 护栏核验失败" "无法建立审查后内容快照，夜班已中止"
+    return 3
+  fi
+  if [ "$review_after" != "$review_before" ]; then
+    GUARD_ABORT_REASON="护栏违规"
+    log "[$id] 护栏违规: 审查适配器修改了 .review/ 之外的 Git 可见内容或索引"
+    push "🚨 护栏违规" "审查适配器修改了仓库内容，夜班已中止"
+    return 3
+  fi
+  # A timeout is generated by this orchestrator and therefore cannot represent a complete review,
+  # even if the adapter wrote a provisional findings file before it was terminated.
+  if [ "$rcode" -eq 124 ]; then
+    log "[$id] 审查超时 ${AI_TIMEOUT_SECS}s，按不完整审查转人工"
+    mark_task_needs_human "$id" || return 4
+    [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
+      && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
+    push "⚠️ 需要拍板" "${title}: 审查超时，未采信临时结果"
+    return 0
+  fi
   local parsed; parsed="$(cli_json parse-review "$ro" "$re" "$rcode")" || return 2
   if [ "$(jq_get "$parsed" ok || echo false)" != true ]; then
     local un; un="$(jq_get "$parsed" unavailable || echo '')"
     if [ -n "$un" ]; then
       log "[$id] claude 不可用: ${un}"
-      node "$CLI" availability-set claude "$un" >/dev/null
-      node "$CLI" set-field "$id" reviewDeferred true >/dev/null
+      node "$CLI" availability-set claude "$un" >/dev/null 2>>"$RUNLOG" || {
+        log "[$id] claude 不可用状态写入失败"
+        return 4
+      }
+      node "$CLI" set-field "$id" reviewDeferred true >/dev/null 2>>"$RUNLOG" || {
+        log "[$id] 挂起审查状态写入失败"
+        return 4
+      }
       return 2
     fi
     log "[$id] 审查未产出可信 findings: $(jq_get "$parsed" reason || echo '')"
-    node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+    mark_task_needs_human "$id" || return 4
+    [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
+      && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
     push "⚠️ 需要拍板" "${title}: 审查未产出可信结果"
     return 0
   fi
 
+  local ff parsed_n
+  if ! ff="$(jq_get "$parsed" findingsFile)" || ! parsed_n="$(jq_get "$parsed" count)"; then
+    log "[$id] 审查成功响应缺少 findingsFile/count，按不可信结果转人工"
+    mark_task_needs_human "$id" || return 4
+    [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
+      && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
+    push "⚠️ 需要拍板" "${title}: 审查响应字段不完整"
+    return 0
+  fi
+  # Findings may live outside the repository or inside its reserved .review/
+  # namespace, but never at an ordinary repository path. Resolve symlinks before
+  # accepting the path so an adapter cannot smuggle a source file in as output.
+  local real_repo real_ff
+  real_repo="$(realpath "$repo" 2>/dev/null)" || real_repo=""
+  real_ff="$(realpath "$ff" 2>/dev/null)" || real_ff=""
+  if [ -z "$real_repo" ] || [ -z "$real_ff" ]; then
+    log "[$id] findings 路径无法规范化，按不可信结果转人工: ${ff}"
+    mark_task_needs_human "$id" || return 4
+    push "⚠️ 需要拍板" "${title}: findings 路径无法可信确认"
+    return 0
+  fi
+  case "$real_ff" in
+    "$real_repo"/.review/*) : ;;
+    "$real_repo"/*)
+      log "[$id] findings 位于普通仓库路径而非 .review/，拒绝记录: ${real_ff}"
+      mark_task_needs_human "$id" || return 4
+      push "⚠️ 需要拍板" "${title}: 审查产物写入了保留区之外"
+      return 0 ;;
+  esac
   # 审查成功 = claude 已恢复（同 R13 #1 的理由: 以实际成功为恢复证据，
   # 而不是等「两侧都 ok」才 availability-reset——那在单侧故障时永远等不到）
-  node "$CLI" availability-set claude ok >/dev/null 2>&1
-  local ff n; ff="$(jq_get "$parsed" findingsFile)"; n="$(jq_get "$parsed" count)"
-  log "[$id] findings ${n} 条"
+  if ! node "$CLI" availability-set claude ok >/dev/null 2>>"$RUNLOG"; then
+    log "[$id] claude 可用性恢复证据写盘失败"
+    return 4
+  fi
   # 路径可能含引号/反斜杠，手工拼 JSON 会炸——交给 node 转义（Codex R5 #8）
-  node "$CLI" set-field-str "$id" lastFindingsFile "$ff" >/dev/null 2>>"$RUNLOG" || {
+  if ! cp "$ff" "$repair_evidence"; then
+    log "[$id] findings 无法复制到仓库外修复证据区，停止本任务"
+    mark_task_needs_human "$id" || return 4
+    return 0
+  fi
+  node "$CLI" set-field-str "$id" lastFindingsFile "$repair_evidence" >/dev/null 2>>"$RUNLOG" || {
     # 写不进去 → 中断恢复时会拿陈旧的 findings 路径去修（Codex R6 #7）
     log "[$id] findings 路径持久化失败，停止本任务"; return 2; }
   # 完整性断言失败 = 审查失败（Codex R1 #4: 原实现只记日志继续，声明 0 条就照样提交）
-  if ! node "$CLI" record-findings "$ff" "$id" "$repo" >/dev/null 2>>"$RUNLOG"; then
+  local rf n authoritative_nh
+  if ! rf="$(cli_json record-findings "$ff" "$id" "$repo")"; then
     log "[$id] findings 完整性断言失败——按审查失败处置"
-    node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+    mark_task_needs_human "$id" || return 4
+    [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
+      && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
     push "⚠️ 需要拍板" "${title}: findings 文件完整性可疑"
     return 0
   fi
+  if ! n="$(jq_get "$rf" declared)" \
+     || ! authoritative_nh="$(jq_get "$rf" needsHuman)" \
+     || [ "$n" != "$parsed_n" ]; then
+    log "[$id] findings 权威条数不可得或与适配器响应不一致，按不可信结果转人工"
+    mark_task_needs_human "$id" || return 4
+    [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
+      && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
+    push "⚠️ 需要拍板" "${title}: findings 条数无法可信确认"
+    return 0
+  fi
+  log "[$id] findings ${n} 条"
 
   # 3. 判定
   local d action; d="$(cli_json push-findings-count "$id" "$n")" || return 2
@@ -1348,46 +2314,84 @@ _process_task_inner() {
   log "[$id] decideNext → ${action}（$(jq_get "$d" reason || echo '')）"
   case "$action" in
     done)
+      # 0 findings is not proof that implementation produced a checkpointable
+      # change. Distinguish an empty diff from a real commit failure so morning
+      # diagnostics do not send the user toward Git configuration or storage.
+      local final_status
+      if ! final_status="$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>>"$RUNLOG")"; then
+        log "[$id] 无法确认最终工作区状态 → needs_human"
+        mark_task_needs_human "$id" || return 4
+        push "⚠️ 需要拍板" "${title}: 无法确认最终工作区状态"
+        return 0
+      fi
+      if [ -z "$final_status" ]; then
+        log "[$id] 本次实现未产生任何改动，未创建 checkpoint → needs_human"
+        mark_task_needs_human "$id" || return 4
+        push "⚠️ 需要拍板" "${title}: 本次实现未产生任何改动"
+        return 0
+      fi
       # 提交失败绝不标 done（Codex R1 #11: 未提交改动会污染下一任务，早报却说已完成）
-      if ! ( cd "$repo" && git add -A && git commit -q -m "sleep-well-codex: ${id} done" ) 2>>"$RUNLOG"; then
+      local done_checkpoint_rc
+      checkpoint_commit "$repo" "sleep-well-codex: ${id} done"
+      done_checkpoint_rc=$?
+      [ "$done_checkpoint_rc" -eq 3 ] && return 3
+      if [ "$done_checkpoint_rc" -ne 0 ]; then
         log "[$id] checkpoint 提交失败 → needs_human"
-        node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+        mark_task_needs_human "$id" || return 4
         push "⚠️ 需要拍板" "${title}: 审查通过但提交失败"; return 0
       fi
       # 状态持久化失败就不能宣告完成（Codex R4 #13）: 否则推送说完成、
       # 磁盘上任务仍是 reviewing，下一跳会重做一遍。
       if ! node "$CLI" advance "$id" done >/dev/null 2>>"$RUNLOG"; then
         log "[$id] 已 checkpoint 但状态写入失败"
-        push "⚠️ 状态异常" "${title}: 已提交但状态未落盘，请查看日志"; return 0
+        push "⚠️ 状态异常" "${title}: 已提交但状态未落盘，请查看日志"; return 4
       fi
       push "✓ 任务完成" "$title"
       ;;
     continue)
       # 高严重度不得自动修（Codex R2 #8）: extractFindings 已把「高」映射成
       # needs-human，但原实现并未据此设门，仍会让 Codex 去改。
-      # high 取自元信息头；与 record-findings 实际抽取到的高危条数交叉校验，
-      # 任一说有高危就按有高危处理（Codex R3 #10: 只信元信息头，头被改坏就漏拦）。
-      local hi hi2
-      hi="$(jq_get "$parsed" high || echo 0)"
-      hi2="$(grep -c '^### #[0-9]* \[高\]' "$ff" 2>/dev/null || echo 0)"
-      [ "${hi2:-0}" -gt "${hi:-0}" ] && hi="$hi2"
+      # Authoritative count comes from the same extractFindings result that was
+      # just persisted. Metadata and a raw heading count remain conservative
+      # tertiary signals: any source saying "high" closes the auto-fix gate.
+      local hi meta_hi raw_hi
+      hi="$authoritative_nh"
+      meta_hi="$(jq_get "$parsed" high || echo 0)"
+      raw_hi="$(grep -c '^### #[0-9]* \[高\]' "$ff" 2>/dev/null || true)"
+      raw_hi="${raw_hi:-0}"
+      [ "${meta_hi:-0}" -gt "${hi:-0}" ] && hi="$meta_hi"
+      [ "${raw_hi:-0}" -gt "${hi:-0}" ] && hi="$raw_hi"
       if [ "${hi:-0}" -gt 0 ]; then
         log "[$id] 含 ${hi} 条高严重度 findings → 不自动修复，转人工"
-        ( cd "$repo" && git add -A && git commit -q -m "sleep-well-codex: ${id} WIP 高危待人工" ) 2>>"$RUNLOG"
-        node "$CLI" advance "$id" needs_human >/dev/null 2>&1
-        [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ] \
+        local high_checkpoint_rc
+        checkpoint_commit "$repo" "sleep-well-codex: ${id} WIP 高危待人工"
+        high_checkpoint_rc=$?
+        [ "$high_checkpoint_rc" -eq 3 ] && return 3
+        [ "$high_checkpoint_rc" -ne 0 ] \
+          && log "[$id] 高危 WIP checkpoint 提交失败（工作仍在工作区）"
+        mark_task_needs_human "$id" || return 4
+        [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
           && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
         push "⚠️ 需要拍板" "${title}: ${hi} 条高严重度，未自动修改"
         return 0
       fi
-      node "$CLI" advance "$id" fixing >/dev/null
+      node "$CLI" advance "$id" fixing >/dev/null 2>>"$RUNLOG" || {
+        log "[$id] reviewing → fixing 状态写入失败"
+        return 4
+      }
       log "[$id] 修复轮"
-      codex_step "$repo" "$(printf '审查发现 %s 条问题，详见 %s 的「Findings」节。\n\n%s\n' \
-                             "$n" "$ff" "$(cat "$SKILL_DIR/prompts/fix.md")")" "$co" "$id" "修复轮 "
+      local fix_rules
+      fix_rules="$(load_constraint_prompt fix.md)" || {
+        GUARD_ABORT_REASON="约束提示词不可得"
+        log "[$id] 无法读取修复约束，拒绝调用 Codex"
+        return 3
+      }
+      codex_step "$repo" "$(printf '原始任务范围（唯一任务授权）:\n%s\n\n审查发现 %s 条问题，详见仓库外只读证据 %s 的「Findings」节。\n\n%s\n' \
+                             "$prompt" "$n" "$repair_evidence" "$fix_rules")" "$co" "$id" "修复轮 "
       local frc=$?; [ "$frc" -ne 0 ] && return "$frc"
       # 修复成功后显式转 reviewing（Codex R4 #3）: 留在 fixing 会让下一轮
       # 走「从中断的修复轮恢复」分支再修一遍，同一份 findings 被重复修改。
-      node "$CLI" advance "$id" reviewing >/dev/null
+      ensure_task_reviewing "$id" || return 4
       ;;
     rotate)
       # rotate 的语义是「对同一份未提交 diff 开全新会话复审」，**不改 diff**
@@ -1403,12 +2407,16 @@ _process_task_inner() {
       :
       ;;
     stop)
-      if ! ( cd "$repo" && git add -A && git commit -q -m "sleep-well-codex: ${id} WIP needs-human" ) 2>>"$RUNLOG"; then
+      local stop_checkpoint_rc
+      checkpoint_commit "$repo" "sleep-well-codex: ${id} WIP needs-human"
+      stop_checkpoint_rc=$?
+      [ "$stop_checkpoint_rc" -eq 3 ] && return 3
+      if [ "$stop_checkpoint_rc" -ne 0 ]; then
         log "[$id] WIP 提交失败（工作仍在工作区）"
       fi
-      node "$CLI" advance "$id" needs_human >/dev/null
+      mark_task_needs_human "$id" || return 4
       # 若工作区仍有残留，持久化 dirtyResidue 以继续阻塞同仓库后续任务（Codex R3 #14）
-      [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ] \
+      [ -n "$(git -C "$repo" status --porcelain -- . ':(exclude).review' 2>/dev/null)" ] \
         && node "$CLI" set-field "$id" dirtyResidue true >/dev/null 2>&1
       push "⚠️ 需要拍板" "${title}: $(jq_get "$d" reason || echo '需人工判断')"
       ;;
@@ -1419,7 +2427,7 @@ _process_task_inner() {
       #    ⚠️ 我在 R13 的 read-back 里写过「已加兜底」，**但那批编辑因前一个锚点失败而整体没写入**，
       #    per-item 的 ✓ 输出在中止前照样打印了。教训: 改完必须回读文件本身，不能信脚本输出。
       log "[$id] decideNext 返回了无法识别的 action: [${action}]——转人工，绝不当成成功"
-      node "$CLI" advance "$id" needs_human >/dev/null 2>&1
+      mark_task_needs_human "$id" || return 4
       push "⚠️ 需要拍板" "${title}: 审修循环判定异常"
       return 2 ;;
   esac
@@ -1428,70 +2436,312 @@ _process_task_inner() {
 
 # ── 主流程 ────────────────────────────────────────────────────────────
 # 终止标记必须在抢锁之前检（否则收工后每 5 分钟仍会重跑一夜）
-# 终止后仍要处理遗留的 hook 恢复（否则用户的 hook 永远回不来）
-if [ -f "$CODEX_HOME/TERMINATED" ]; then
-  [ -f "$CODEX_HOME/hook-recovery.json" ] && { HOOK_STATE="$CODEX_HOME/hook-recovery.json"; recover_pending_hook || true; }
+# 终止后仍要处理遗留的 hook 恢复（否则用户的 hook 永远回不来）。整个分支在
+# 独立进程组里限时运行，因为此时尚未持锁、主看门狗也不能安全共享心跳。
+handle_terminated_state() {
+  local recovery_ok=yes had_hook_recovery=no recovery_rc=0
+  if [ -f "$SW_RUNTIME_HOME/hook-recovery.json" ]; then
+    had_hook_recovery=yes
+    HOOK_STATE="$SW_RUNTIME_HOME/hook-recovery.json"
+    recover_pending_hook || recovery_rc=$?
+    case "$recovery_rc" in
+      0) ;;
+      2)
+        log "node 不可用，终止态 hook 恢复已延期"
+        push_once terminated-recovery-node-missing "⚠️ 夜班收尾待恢复" \
+          "缺少依赖: node；pre-push hook 恢复材料已保留"
+        recovery_ok=no ;;
+      *) log "hook 仍待人工恢复；本夜已终止，不重复推送"; recovery_ok=no ;;
+    esac
+  fi
+  # finalize may already have published TERMINATED before hook restoration
+  # failed. Keep retrying recovery while loaded; once recovery succeeds, finish
+  # the deferred self-unload so the five-minute launchd trigger really stops.
+  if [ "$recovery_ok" = yes ]; then
+    if [ "$had_hook_recovery" = yes ]; then
+      # This is delayed cleanup from a real terminal run, not an operator who
+      # forgot terminal-clear. Tell the truth before unload can terminate us.
+      push_once terminated-recovery-complete "✓ 夜班收尾恢复" \
+        "pre-push hook 已恢复；正在完成 launchd 自卸载。下一夜请照常清 STOP、terminal-clear 后再 load"
+    else
+      # A marker with no pending recovery most often means the operator
+      # re-loaded launchd but forgot the documented terminal-clear step.
+      push_once terminated-noop "⚠️ 夜班未开工" "上一夜的终止标记仍在；请先执行 terminal-clear 再重新 load"
+    fi
+    launchctl unload "$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist" 2>/dev/null \
+      && log "终止态 hook 恢复完成，已自卸载 launchd" \
+      || log "终止态 launchd 卸载跳过（可能未安装）"
+  fi
+  return 0
+}
+if [ -f "$SW_RUNTIME_HOME/TERMINATED" ]; then
+  run_startup_bounded "终止态恢复与自卸载" handle_terminated_state \
+    || log "⚠️ 终止态恢复未在启动时限内完成；保留状态供下一次重试"
   exit 0
 fi
-acquire_lock || exit 0
+LOCK_RC=0
+acquire_lock || LOCK_RC=$?
+case "$LOCK_RC" in
+  0) ;;
+  1) exit 0 ;;
+  *)
+    # Do not steal or terminate a possibly-live unverifiable owner.  Publish a
+    # single durable diagnostic instead; subsequent launchd/manual retries stay
+    # quiet until a lock is successfully acquired and clears the marker.
+    run_startup_bounded "锁异常告警" push_once lock-anomaly \
+      "⚠️ 夜班未开工" "锁状态异常，无法安全验证持有者；详情见本机日志" \
+      || log "⚠️ 锁异常告警未在启动时限内完成"
+    exit 0 ;;
+esac
+# Validate watchdog inputs before starting it. The numeric checks are pure
+# shell; the failure notification is explicitly bounded because push() may use
+# node and curl. Once validation succeeds, publish a fresh heartbeat and arm the
+# watchdog before hook recovery, STOP/cutoff handling, or dependency probes.
+# 超大超时会同时关掉 run_with_timeout 与主看门狗：长调用每 30 秒刷新心跳，
+# 所以看门狗也不会替一个几百万秒的 AI 超时兜底。对显式垃圾值必须在任何 AI、
+# 依赖探针和 hook 操作之前可见地失败关闭，不能静默采用或进入算术扩张。
+AI_TIMEOUT_VALID=yes
+if AI_TIMEOUT_SECS="$(normalize_decimal "$AI_TIMEOUT_SECS")"; then :; else AI_TIMEOUT_VALID=no; fi
+if [ "$AI_TIMEOUT_VALID" = yes ] \
+   && { [ "${#AI_TIMEOUT_SECS}" -gt 5 ] || [ "$AI_TIMEOUT_SECS" -lt 1 ] || [ "$AI_TIMEOUT_SECS" -gt 86400 ]; }; then
+  AI_TIMEOUT_VALID=no
+fi
+HANG_LIMIT_VALID=yes
+if HANG_LIMIT_SECS="$(normalize_decimal "$HANG_LIMIT_SECS")"; then :; else HANG_LIMIT_VALID=no; fi
+if [ "$HANG_LIMIT_VALID" = yes ] \
+   && { [ "${#HANG_LIMIT_SECS}" -gt 5 ] || [ "$HANG_LIMIT_SECS" -lt 1 ] || [ "$HANG_LIMIT_SECS" -gt 87300 ]; }; then
+  HANG_LIMIT_VALID=no
+fi
+if [ "$AI_TIMEOUT_VALID" != yes ] || [ "$HANG_LIMIT_VALID" != yes ]; then
+  [ "$AI_TIMEOUT_VALID" = yes ] \
+    || log "⚠️ SLEEP_WELL_AI_TIMEOUT 超出 1–86400 秒；本夜未开工"
+  [ "$HANG_LIMIT_VALID" = yes ] \
+    || log "⚠️ SLEEP_WELL_HANG_LIMIT 超出 1–87300 秒；本夜未开工"
+  if [ -f "$STOP_FILE" ]; then
+    # STOP is the emergency brake. Use bounded defaults only for its cleanup
+    # path so an invalid plist value cannot strand an active run or hook.
+    AI_TIMEOUT_SECS=1800
+    HANG_LIMIT_SECS=2700
+    log "STOP 已存在；仅为收尾采用安全超时默认值"
+  else
+    CONFIG_STATUS_LINE='- 状态: 未开工（没有活动运行）'
+    CONFIG_ACTIVE_LINE='- 活动状态: 无'
+    if [ -s "$STATE_DIR/current-run.json" ]; then
+      CONFIG_STATUS_LINE='- 状态: 本跳未开工（配置错误）；本夜已有活动运行'
+      CONFIG_ACTIVE_LINE='- 活动状态: 已保留；修复配置后下一跳继续，届时早报会重新渲染完整任务表'
+    fi
+    HOOK_HINT=""
+    HOOK_REPORT_LINE=""
+    if [ -f "$SW_RUNTIME_HOME/hook-recovery.json" ]; then
+      HOOK_HINT='；另有 pre-push hook 待恢复，修复前 git push 可能被阻断'
+      HOOK_REPORT_LINE='- 待处理: 存在未完成的 pre-push hook 恢复；修复配置前 git push 可能被阻断'
+    fi
+    CONFIG_REPORT_TMP="$SW_RUNTIME_HOME/morning-report.md.tmp.$$"
+    { printf '# sleep-well-codex 早报\n\n';
+      printf '%s\n' "$CONFIG_STATUS_LINE";
+      printf -- '- 原因: SLEEP_WELL_AI_TIMEOUT/HANG_LIMIT 配置非法\n';
+      printf '%s\n' "$CONFIG_ACTIVE_LINE";
+      [ -z "$HOOK_REPORT_LINE" ] || printf '%s\n' "$HOOK_REPORT_LINE";
+      printf -- '- 时间: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; } \
+      >"$CONFIG_REPORT_TMP" 2>/dev/null \
+      && chmod 600 "$CONFIG_REPORT_TMP" 2>/dev/null \
+      && mv -f "$CONFIG_REPORT_TMP" "$SW_RUNTIME_HOME/morning-report.md" 2>/dev/null \
+      || { rm -f "$CONFIG_REPORT_TMP" 2>/dev/null; log "⚠️ 配置错误早报写入失败"; }
+    run_startup_bounded "非法超时告警" push_once invalid-timeout \
+      "⚠️ 夜班未开工" \
+      "SLEEP_WELL_AI_TIMEOUT/HANG_LIMIT 配置非法；本夜未开工${HOOK_HINT}" \
+      || log "⚠️ 非法超时告警未在启动时限内完成"
+    FINISHED=yes
+    exit 1
+  fi
+else
+  # A repaired configuration must be able to warn again if it later regresses.
+  clear_push_once invalid-timeout
+fi
+# 不静默改写运维显式设的合法 AI 超时（原来 <60 一律抬到 60，于是 e2e
+# 里设 5 实际跑的是 60，而那条「超时生效」断言仍会绿）。小于 60 只告警。
+# 看门狗的两个新参数同样要校验（Codex R12 #5）: 非数值/0/负值会让 `sleep` 持续失败
+# 变成烧 CPU 的空转循环，或让宽限期归零、TERM 刚发出就升级 KILL（EXIT trap 来不及跑）。
+if WATCHDOG_POLL_SECS="$(normalize_decimal "$WATCHDOG_POLL_SECS")" \
+   && [ "${#WATCHDOG_POLL_SECS}" -le 18 ]; then :; else
+  log "⚠️ WATCHDOG_POLL 非法，回落 30"; WATCHDOG_POLL_SECS=30
+fi
+[ "$WATCHDOG_POLL_SECS" -lt 1 ] \
+  && { log "⚠️ 看门狗轮询 ${WATCHDOG_POLL_SECS}s 过小，抬到 1"; WATCHDOG_POLL_SECS=1; }
+[ "$WATCHDOG_POLL_SECS" -gt 300 ] \
+  && { log "⚠️ 看门狗轮询 ${WATCHDOG_POLL_SECS}s 过大，压到 300"; WATCHDOG_POLL_SECS=300; }
+if WATCHDOG_GRACE_SECS="$(normalize_decimal "$WATCHDOG_GRACE_SECS")" \
+   && [ "${#WATCHDOG_GRACE_SECS}" -le 18 ]; then :; else
+  log "⚠️ WATCHDOG_GRACE 非法，回落 30"; WATCHDOG_GRACE_SECS=30
+fi
+[ "$WATCHDOG_GRACE_SECS" -lt 3 ] && { log "⚠️ 看门狗宽限期 ${WATCHDOG_GRACE_SECS}s 过短，抬到 3"; WATCHDOG_GRACE_SECS=3; }
+[ "$WATCHDOG_GRACE_SECS" -gt 300 ] \
+  && { log "⚠️ 看门狗宽限期 ${WATCHDOG_GRACE_SECS}s 过大，压到 300"; WATCHDOG_GRACE_SECS=300; }
+[ "$AI_TIMEOUT_SECS" -lt 60 ] && log "注意: AI 超时设为 ${AI_TIMEOUT_SECS}s，偏小"
+if [ "$HANG_LIMIT_SECS" -le "$AI_TIMEOUT_SECS" ]; then
+  HANG_LIMIT_SECS=$((AI_TIMEOUT_SECS + 900))
+  log "⚠️ 挂起阈值须大于 AI 超时，已抬到 ${HANG_LIMIT_SECS}s"
+fi
+# 残留的 active-pgid 只可能来自已死的上一次运行——留着会让看门狗对已复用的号发信号
+rm -f "$ACTIVE_PGID_FILE" 2>/dev/null
+beat
+start_watchdog
+# A node-specific pause marker must survive repeated unavailable ticks, but it
+# must not silence a different hook-conflict or terminal alert after node heals.
+if command -v node >/dev/null 2>&1 \
+   && node -e 'process.exit(0)' >/dev/null 2>&1; then
+  clear_push_once node-paused
+fi
 # 恢复失败**必须中止本跳**（Codex R8 #7）: 原来只记日志就继续，后续 guard_install
 # 会写新的阻断 hook 并覆盖恢复记录，把仍然存在的旧备份变成永久孤儿。
 # 状态文件保留着，下一跳会再试；人工修好后它自然通过。
-recover_pending_hook || {
-  log "hook 恢复未完成——本跳不开工，待人工处理或下跳重试"
-  FINISHED=yes; exit 0          # 锁由 on_exit trap 释放
-}
-beat
-# 环境变量必须校验（Codex R9 #6）: 两个阈值的关系弄反会让看门狗杀掉正常运行的调用。
-case "$AI_TIMEOUT_SECS" in *[!0-9]*|'') log "⚠️ SLEEP_WELL_AI_TIMEOUT 非法，回落 1800"; AI_TIMEOUT_SECS=1800 ;; esac
-case "$HANG_LIMIT_SECS" in *[!0-9]*|'') log "⚠️ SLEEP_WELL_HANG_LIMIT 非法，回落 2700"; HANG_LIMIT_SECS=2700 ;; esac
-# 只在明显是垃圾值时才兜底，**不静默改写运维显式设的数**（原来 <60 一律抬到 60，
-# 于是 e2e 里设 5 实际跑的是 60，而那条「超时生效」的断言还是绿的——测试分不清 5 和 60，
-# 就不算在测这个参数）。小于 60 只告警，小于 5 才认为是笔误。
-# 看门狗的两个新参数同样要校验（Codex R12 #5）: 非数值/0/负值会让 `sleep` 持续失败
-# 变成烧 CPU 的空转循环，或让宽限期归零、TERM 刚发出就升级 KILL（EXIT trap 来不及跑）。
-case "$WATCHDOG_POLL_SECS" in ''|*[!0-9]*) log "⚠️ WATCHDOG_POLL 非法，回落 30"; WATCHDOG_POLL_SECS=30 ;; esac
-[ "$WATCHDOG_POLL_SECS" -lt 1 ] && WATCHDOG_POLL_SECS=1
-case "$WATCHDOG_GRACE_SECS" in ''|*[!0-9]*) log "⚠️ WATCHDOG_GRACE 非法，回落 30"; WATCHDOG_GRACE_SECS=30 ;; esac
-[ "$WATCHDOG_GRACE_SECS" -lt 3 ] && { log "⚠️ 看门狗宽限期 ${WATCHDOG_GRACE_SECS}s 过短，抬到 3"; WATCHDOG_GRACE_SECS=3; }
-[ "$AI_TIMEOUT_SECS" -lt 60 ] && log "注意: AI 超时设为 ${AI_TIMEOUT_SECS}s，偏小"
-[ "$AI_TIMEOUT_SECS" -lt 5 ] && { log "⚠️ AI 超时 ${AI_TIMEOUT_SECS}s 不合理，抬到 5"; AI_TIMEOUT_SECS=5; }
-if [ "$HANG_LIMIT_SECS" -le "$AI_TIMEOUT_SECS" ]; then
-  HANG_LIMIT_SECS=$((AI_TIMEOUT_SECS + 300))
-  log "⚠️ 挂起阈值须大于 AI 超时，已抬到 ${HANG_LIMIT_SECS}s"
-fi
+HOOK_RECOVERY_RC=0
+recover_pending_hook || HOOK_RECOVERY_RC=$?
+case "$HOOK_RECOVERY_RC" in
+  0) ;;
+  2)
+    if [ -f "$STOP_FILE" ]; then
+      if [ -s "$STATE_DIR/current-run.json" ]; then
+        finish_without_run "STOP 已生效；缺少依赖: node，恢复材料未处理" \
+          "STOP 存在且 node 不可用；hook 恢复材料与活动状态原样保留" \
+          "⚠️ 需要手动处理" 1 \
+          "STOP 已生效；活动状态与 hook 恢复材料未处理，请检查本机状态与目标仓库"
+      fi
+      finish_without_run \
+        "STOP 已生效；缺少依赖: node，没有活动运行；hook 恢复材料未处理" \
+        "STOP 存在且 node 不可用；没有活动运行，hook 恢复材料原样保留" \
+        "⚠️ 需要手动处理" 1 \
+        "STOP 已生效；hook 恢复材料未处理，本夜不会自动重试；修复后请 terminal-clear 并重新 load"
+    fi
+    if [ -s "$STATE_DIR/current-run.json" ]; then
+      finish_without_run "缺少依赖: node" \
+        "node 不可用，无法解析 hook 恢复元数据；恢复材料已保留" \
+        "⚠️ 夜班暂停" 1 \
+        "缺少依赖: node；活动状态与 pre-push hook 恢复材料已保留，下一跳重试" \
+        yes node-paused
+    fi
+    finish_without_run \
+      "缺少依赖: node；pre-push hook 恢复材料已保留；本夜不会自动重试，修复后请 terminal-clear 并重新 load" \
+      "node 不可用且没有活动运行；恢复材料原样保留，本夜终止" \
+      "⚠️ 夜班未开工" 1 \
+      "缺少依赖: node；pre-push hook 恢复材料已保留，本夜不会自动重试；修复后请 terminal-clear 并重新 load" ;;
+  *)
+    finish_without_run "pre-push hook 待人工恢复" \
+      "hook 恢复未完成——本夜停止，保留恢复材料待人工处理" \
+      "⚠️ 需要手动处理" 1 "pre-push hook 未恢复；详情见本机日志" ;;
+esac
 # 依赖预检: 缺什么就说缺什么，不要等到某个子步骤失败后报一个指错方向的原因
+# >>>TESTABLE:preflight>>>
+PREFLIGHT_DETAIL=""
+PREFLIGHT_PUBLIC_MISSING=""
 preflight_deps() {
-  local missing=""
-  for b in codex node git realpath shasum xargs; do
-    command -v "$b" >/dev/null 2>&1 || missing="${missing} ${b}"
+  local missing="" public_missing=""
+  local user_codex_home="${SW_USER_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"
+  if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(0)' >/dev/null 2>&1; then
+    missing="${missing} node"
+    public_missing="${public_missing} node"
+  fi
+  for b in git realpath shasum xargs ps link; do
+    if ! command -v "$b" >/dev/null 2>&1; then
+      missing="${missing} ${b}"
+      public_missing="${public_missing} ${b}"
+    fi
   done
-  [ -x "$REVIEW_SH" ] || missing="${missing} claude-handoff(${REVIEW_SH})"
+  if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
+    missing="${missing} codex(${CODEX_BIN})"
+    public_missing="${public_missing} codex"
+  fi
+  if [ ! -r "$user_codex_home/auth.json" ]; then
+    missing="${missing} codex-auth(${user_codex_home}/auth.json)"
+    public_missing="${public_missing} codex-auth"
+  fi
+  if [ ! -x "$REVIEW_SH" ]; then
+    missing="${missing} claude-handoff(${REVIEW_SH})"
+    public_missing="${public_missing} claude-handoff"
+  fi
+  local prompt_rel
+  for prompt_rel in prompts/implement.md prompts/fix.md; do
+    if [ ! -r "$SKILL_DIR/$prompt_rel" ] || [ ! -s "$SKILL_DIR/$prompt_rel" ]; then
+      missing="${missing} ${prompt_rel}"
+      public_missing="${public_missing} skill-prompts"
+    fi
+  done
   if [ -n "$missing" ]; then
+    PREFLIGHT_DETAIL="$missing"
+    PREFLIGHT_PUBLIC_MISSING="$public_missing"
     log "⚠️ 缺少依赖:${missing}（PATH=${PATH}）"
-    push "⚠️ 夜班未开工" "缺少依赖:${missing}"
     return 1
   fi
   return 0
 }
-preflight_deps || { FINISHED=yes; exit 0; }
-require_realpath || { FINISHED=yes; exit 0; }
-# 残留的 active-pgid 只可能来自已死的上一次运行——留着会让看门狗对已复用的号发信号
-rm -f "$ACTIVE_PGID_FILE" 2>/dev/null
-start_watchdog
-log "=== 取得锁，开工（pid $$，AI 超时 ${AI_TIMEOUT_SECS}s / 挂起阈值 ${HANG_LIMIT_SECS}s）==="
+# <<<TESTABLE:preflight<<<
 
-[ -f "$STOP_FILE" ] && { node "$CLI" init >/dev/null 2>&1; finalize "见到 STOP 文件"; }
+# STOP is the user's emergency brake and must work even when a dependency is missing.
+if [ -f "$STOP_FILE" ]; then
+  if [ -s "$STATE_DIR/current-run.json" ]; then
+    if command -v node >/dev/null 2>&1 \
+       && node -e 'process.exit(0)' >/dev/null 2>&1; then
+      finalize "见到 STOP 文件"
+    fi
+    # The activity exists even though node is unavailable. Preserve it and say
+    # so; claiming "没有活动运行" would hide possible repository residue.
+    finish_without_run "STOP 已生效；活动状态因缺少 node 未能归档" \
+      "STOP 存在且检测到活动状态，但 node 不可用；状态原样保留待人工核对" \
+      "⚠️ 需要手动处理" 1 \
+      "STOP 已生效；活动状态未归档，请检查本机状态文件与目标仓库"
+  fi
+  finish_without_run "STOP 已生效；没有活动运行" "STOP 存在且没有可收尾的活动状态"
+fi
+
+# An existing run must still honor its morning cutoff before dependency checks.
+if command -v node >/dev/null 2>&1 && [ -s "$STATE_DIR/current-run.json" ] \
+   && [ "$(jq_get "$(cli_json cutoff-passed || echo '{}')" passed || echo false)" = true ]; then
+  finalize "到达 cutoff"
+fi
+
+if ! preflight_deps; then
+  case "$PREFLIGHT_PUBLIC_MISSING" in
+    *node*)
+      if [ -s "$STATE_DIR/current-run.json" ]; then
+        finish_without_run \
+          "缺少依赖:${PREFLIGHT_PUBLIC_MISSING}；本夜已有活动运行且未归档" \
+          "缺少依赖:${PREFLIGHT_DETAIL}（PATH=${PATH}）；活动状态原样保留" \
+          "⚠️ 夜班暂停" 1 \
+          "缺少依赖:${PREFLIGHT_PUBLIC_MISSING}；活动状态未归档，请检查本机状态文件与目标仓库" \
+          yes node-paused
+      fi ;;
+  esac
+  finish_without_run "缺少依赖:${PREFLIGHT_PUBLIC_MISSING}" "缺少依赖:${PREFLIGHT_DETAIL}（PATH=${PATH}）"
+fi
+# Migrate/clear the older generic pause marker once all dependency probes pass.
+clear_push_once finish-without-run
+require_realpath \
+  || finish_without_run "realpath 不可用" "realpath 能力检查失败"
+log "=== 取得锁，开工（pid $$，AI 超时 ${AI_TIMEOUT_SECS}s / 挂起阈值 ${HANG_LIMIT_SECS}s）==="
+HAD_ACTIVE_STATE=no
+[ -s "$STATE_DIR/current-run.json" ] && HAD_ACTIVE_STATE=yes
 INIT_ERR="$(node "$CLI" init 2>&1 >/dev/null)"; INIT_RC=$?
 if [ $INIT_RC -ne 0 ]; then
-  log "init 失败: ${INIT_ERR}"
-  # 队列为空/缺失也要走正常收工: 否则 launchd 每 5 分钟静默重试到天亮，
-  # 用户既没有早报也没有推送，不知道夜班根本没开工（Codex R3 #17）。
-  node "$SKILL_DIR/bin/report.mjs" >/dev/null 2>&1 || log "早报生成失败（未开工路径）"
-  push "⚠️ 夜班未开工" "$(printf '%.150s' "未开工: ${INIT_ERR:-队列为空或不存在}")"
-  node "$CLI" terminal-set "队列为空" >/dev/null 2>&1
-  launchctl unload "$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist" 2>/dev/null
-  FINISHED=yes; exit 0
+  finish_without_run "队列或配置无效" "${INIT_ERR:-队列为空或不存在}"
+fi
+
+# Guard baselines live in the orchestrator process. If an earlier process died
+# after an AI write but before its post-call verification, automatically
+# resuming an in-flight task would absorb that unverified content as a new
+# baseline. Quarantine only persisted in-flight tasks; pending work can proceed.
+if [ "$HAD_ACTIVE_STATE" = yes ]; then
+  QUARANTINE_JSON="$(cli_json quarantine-inflight)" \
+    || finish_without_run "状态恢复不可验证" "无法隔离上一进程的在途任务"
+  QUARANTINE_N="$(jq_get "$QUARANTINE_JSON" count)" \
+    || finish_without_run "状态恢复不可验证" "无法读取在途任务隔离结果"
+  QUARANTINE_GRACEFUL="$(jq_get "$QUARANTINE_JSON" graceful)" \
+    || finish_without_run "状态恢复不可验证" "无法读取上一跳退出证明"
+  if [ "$QUARANTINE_GRACEFUL" = true ]; then
+    log "已验证上一进程为计划内跳退出；保留在途任务供本跳续跑"
+  elif [ "$QUARANTINE_N" -gt 0 ]; then
+    log "已隔离上一进程遗留的 ${QUARANTINE_N} 个在途任务 → needs_human（不重建护栏基线）"
+    push "⚠️ 需要拍板" "上一进程中断；${QUARANTINE_N} 个在途任务未自动续跑，以免吸收未核验改动"
+  fi
 fi
 
 # cutoff 必须在退避之前判（Codex R2 #14）: 否则退避期跨过早晨，夜班不会按时收工出早报。
@@ -1499,15 +2749,14 @@ if [ "$(jq_get "$(cli_json cutoff-passed || echo '{}')" passed || echo false)" =
   finalize "到达 cutoff"
 fi
 # 隔离 CODEX_HOME 必须在任何 codex 调用之前备妥；备不出来就不开工
-if ! prepare_codex_home; then
-  log "无法准备隔离的 CODEX_HOME，拒绝开工"
-  push "⚠️ 夜班未开工" "无法准备隔离运行环境（MCP 未能清空）"
-  FINISHED=yes; exit 1
-fi
+prepare_codex_home \
+  || finish_without_run "隔离运行环境不可用" \
+       "prepare_codex_home 失败（详见前序日志）" \
+       "⚠️ 夜班未开工" 1 "隔离运行环境不可用；详情见本机日志"
 
 # 退避未到点则本跳直接退出（Codex R1 #7: 原实现算了 hops 却不等，5 分钟后照常重试）
 if [ "$(jq_get "$(cli_json retry-due || echo '{}')" due || echo true)" != true ]; then
-  log "退避未到点，本跳退出"; FINISHED=yes; exit 0
+  log "退避未到点，本跳退出"; graceful_hop_exit "退避未到点"
 fi
 # ⚠️ 顺序（Codex R2 #6）: 必须**先**按已持久化的可用性判一次 halt，再重置。
 # 直接重置会把上一跳记录的 auth 抹掉，认证失效永远走不到 halt。
@@ -1547,18 +2796,18 @@ while :; do
       log "两侧均不可用: $(jq_get "$hop" reason || echo '')"
       bo="$(cli_json backoff-schedule)" || hop_fail "退避排期失败"
       [ "$(jq_get "$bo" giveUp || echo false)" = true ] && finalize "退避耗尽（约 3 小时重试无果）"
-      log "排期 $(jq_get "$bo" hops) 跳后重试"; FINISHED=yes; exit 0 ;;
+      log "排期 $(jq_get "$bo" hops) 跳后重试"; graceful_hop_exit "两侧不可用，等待退避" ;;
   esac
 
   nt="$(cli_json next-task)" || hop_fail "取任务失败（状态可能损坏）"
-  tid="$(jq_get "$nt" task.id || echo '')"
+  tid="$(jq_get "$nt" taskId)" || hop_fail "无法读取 next-task.taskId（状态可能损坏）"
   # fix-only: 只把在途任务推完，绝不开新的（开了也只会去调不可用的 codex）
   if [ -n "$tid" ] && [ "$HOP_MODE" = fix-only ] \
      && [ "$(jq_get "$nt" task.status || echo pending)" = pending ]; then
     log "codex 不可用且下一个是新任务，本跳不开工"
     bo="$(cli_json backoff-schedule)" || hop_fail "退避排期失败"
     [ "$(jq_get "$bo" giveUp || echo false)" = true ] && finalize "退避耗尽（codex 长时间不可用）"
-    FINISHED=yes; exit 0
+    graceful_hop_exit "Codex 不可用，不取新任务"
   fi
   if [ -z "$tid" ]; then
     if [ "$(jq_get "$nt" deferred || echo false)" = true ]; then
@@ -1569,18 +2818,21 @@ while :; do
       node "$CLI" availability-reset >/dev/null 2>&1
       bo="$(cli_json backoff-schedule)" || hop_fail "退避排期失败"
       [ "$(jq_get "$bo" giveUp || echo false)" = true ] && finalize "退避耗尽"
-      FINISHED=yes; exit 0
+      graceful_hop_exit "挂起审查等待下一跳"
     fi
     if [ "$(jq_get "$nt" blockedBySameRepo || echo false)" = true ]; then
       log "同仓库串行阻塞，排退避后退出"
       bo="$(cli_json backoff-schedule)" || hop_fail "退避排期失败"
       [ "$(jq_get "$bo" giveUp || echo false)" = true ] && finalize "退避耗尽"
-      FINISHED=yes; exit 0
+      graceful_hop_exit "同仓库串行阻塞"
     fi
     finalize "队列已清空"
   fi
 
-  process_task "$tid" "$(jq_get "$nt" task.repo)" "$(jq_get "$nt" task.status)" \
+  if ! task_repo="$(jq_get "$nt" task.repo)" || ! task_status="$(jq_get "$nt" task.status)"; then
+    hop_fail "任务状态缺少 repo/status（状态可能损坏）"
+  fi
+  process_task "$tid" "$task_repo" "$task_status" \
                "$(jq_get "$nt" task.prompt || echo '')" "$(jq_get "$nt" task.title || echo "$tid")"
   rc=$?
   case $rc in
@@ -1600,11 +2852,12 @@ while :; do
          bo="$(cli_json backoff-schedule)" || hop_fail "退避排期失败"
          [ "$(jq_get "$bo" giveUp || echo false)" = true ] && finalize "退避耗尽（约 3 小时重试无果）"
          log "[$tid] 连续两次因可用性中断，排退避后退出本跳"
-         FINISHED=yes; exit 0
+         graceful_hop_exit "连续可用性中断，等待退避"
        fi
        log "[$tid] 可用性中断，本跳继续（中继模式会接管）"
        continue ;;
-    3) finalize "护栏违规，中止整夜" ;;
+    3) finalize "${GUARD_ABORT_REASON:-护栏不可得}，中止整夜" ;;
+    4) hop_fail "任务状态无法可靠推进（状态读写失败）" ;;
     *) # 成功推进即清零连续失败计数（Codex R14 #4）: 原来只在任务 ID 变化时重置，
        # 于是「同一任务先中断一次、重试成功、再遇一次中断」会被误判成「连续两次」而结束本跳。
        CONSEC_UNAVAIL_ID=""; CONSEC_UNAVAIL_N=0

@@ -37,20 +37,13 @@ export function loadState(path) {
 
 const IN_FLIGHT = ["implementing", "reviewing", "fixing"];
 
-// ⚠️ 这里原来有 `nextPending` 与 `nextTask` 两个导出，**生产代码一次都没调用过**
-//    （`cli.mjs` 的 next-task 自己实现了一套带同仓库串行的选择器），
-//    却各有 2 和 4 条单测——**测的东西和用的东西是两个实现，而用的那个没有任何单测**
-//    （R16 自查）。「58 项单测通过」于是让人以为任务选择被覆盖了。
-//    处置: 删掉死代码，把**生产选择器**搬到这里，让测试测的就是跑的那一份。
-//
 // selectNextTask(state, repoIsDirty) → { task, deferred, blockedBySameRepo }
 //   repoIsDirty(repo) 由调用方注入（cli.mjs 传真实的 git status 探测，测试传桩）。
 export function selectNextTask(state, repoIsDirty = () => true) {
-  // 同仓库严格串行（用户 2026-08-10 裁定；Codex R1 #8）: 某仓库若有任务在途或挂起，
+  // 同仓库严格串行：某仓库若有任务在途或挂起，
   // 它的未提交 diff 还在工作区——此时取同仓库的下一个任务，两份改动会混进同一次审查与
   // `git add -A`，甚至以 t2 的名义提交 t1 的工作。
-  // needs_human 且留了残留的仓库也要继续阻塞（Codex R2 #9），但 dirtyResidue 只是
-  // 「当时留了残留」的记录，人工清理后不应永久阻塞——每次判定复核实际状态（Codex R5 #10）。
+  // needs_human 且留了残留的仓库也要继续阻塞；人工清理后通过实际状态复核解除阻塞。
   const busyRepos = new Set(
     state.tasks.filter((t) =>
       IN_FLIGHT.includes(t.status) ||

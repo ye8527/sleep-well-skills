@@ -7,10 +7,8 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>exec "$HOME/.claude/skills/sleep-well/bin/watchdog.sh"</string>
+    <string>umask 077; mkdir -p "$HOME/Library/Logs/sleep-well" || exit 1; chmod 700 "$HOME/Library/Logs/sleep-well" || exit 1; exec "$HOME/.claude/skills/sleep-well/bin/watchdog.sh" >>"$HOME/Library/Logs/sleep-well/watchdog.out" 2>>"$HOME/Library/Logs/sleep-well/watchdog.err"</string>
   </array>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>/tmp/sleepwell-watchdog.out</string>
-  <key>StandardErrorPath</key><string>/tmp/sleepwell-watchdog.err</string>
 </dict></plist>

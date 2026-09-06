@@ -9,6 +9,27 @@ import { execFileSync } from "node:child_process";
 
 const CODEX = process.env.SLEEP_WELL_CODEX || "codex"; // resolver wrapper on PATH
 
+export function reviewTimeoutMs(raw = process.env.SLEEP_WELL_AI_TIMEOUT) {
+  if (raw == null || raw === "") return 1_800_000;
+  const text = String(raw);
+  if (!/^\d+$/.test(text)) throw new Error("SLEEP_WELL_AI_TIMEOUT must be an integer number of seconds");
+  const seconds = Number(text);
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 86_400) {
+    throw new Error("SLEEP_WELL_AI_TIMEOUT must be between 1 and 86400 seconds");
+  }
+  return seconds * 1000;
+}
+
+export function reviewExecOptions(repo, timeoutRaw = process.env.SLEEP_WELL_AI_TIMEOUT) {
+  return {
+    encoding: "utf-8",
+    cwd: repo,
+    maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: reviewTimeoutMs(timeoutRaw),
+  };
+}
+
 export function buildReviewArgs({ scope = "uncommitted", base }) {
   const args = ["exec", "review"];
   if (scope === "base") args.push("--base", base);
@@ -26,13 +47,16 @@ export function buildReviewArgs({ scope = "uncommitted", base }) {
 //      item.type:"agent_message" and item.text containing natural-language findings.
 //      We collect all agent_message texts and expose them as agentText.
 //
-// Returns { count, findings, agentText? }
+// Returns { count, findings, reviewed, agentText? }
 //   count    — length of structured findings[] (0 when only prose output)
 //   findings — structured finding objects ([] when only prose output)
+//   reviewed — true only when at least one structured findings array (including
+//              an explicit empty array) or non-empty agent_message was observed
 //   agentText — concatenated agent_message text(s); present only when found
 export function parseFindings(output) {
   const lines = String(output).trim().split("\n").filter(Boolean);
   let findings = [];
+  let structuredSeen = false;
   const agentTexts = [];
 
   for (const line of lines) {
@@ -41,7 +65,10 @@ export function parseFindings(output) {
     if (!obj) continue;
 
     // Structured findings array (assumed schema / future codex versions)
-    if (Array.isArray(obj.findings)) findings = obj.findings;
+    if (Array.isArray(obj.findings)) {
+      findings = obj.findings;
+      structuredSeen = true;
+    }
 
     // Real codex 0.133.x: agent_message text inside item.completed
     if (
@@ -55,17 +82,17 @@ export function parseFindings(output) {
     }
   }
 
-  const result = { count: findings.length, findings };
+  const result = {
+    count: findings.length,
+    findings,
+    reviewed: structuredSeen || agentTexts.length > 0,
+  };
   if (agentTexts.length > 0) result.agentText = agentTexts.join("\n\n");
   return result;
 }
 
 // Live call — integration, not unit-tested. repo is passed via cwd (codex review has no -C).
 export function runReview({ repo, scope = "uncommitted", base }) {
-  const out = execFileSync(CODEX, buildReviewArgs({ scope, base }), {
-    encoding: "utf-8",
-    cwd: repo,
-    maxBuffer: 32 * 1024 * 1024,
-  });
+  const out = execFileSync(CODEX, buildReviewArgs({ scope, base }), reviewExecOptions(repo));
   return parseFindings(out);
 }

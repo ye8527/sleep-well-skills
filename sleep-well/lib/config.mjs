@@ -17,6 +17,8 @@ export const DEFAULTS = {
   discovery_repo: "~/Projects/example-repo",
   discovery_tiers_auto: [1, 2, 3],
   discovery_tiers_propose: [4],
+  // Shared default for the Claude variant. The Codex orchestrator passes its
+  // independent ~/sleep-well/codex/backups path explicitly.
   backup_dir: "~/sleep-well/backups",
   backup_nongit_docs: true,
   backup_cleanup: "on-confirm",
@@ -28,10 +30,20 @@ export function expandHome(p) {
   return p;
 }
 
-export function mergeConfig(userCfg = {}) {
-  return { ...DEFAULTS, ...userCfg };
+export function parseMorningHour(value) {
+  const match = typeof value === "string" && /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+  if (!match) throw new TypeError("morning_hour 必须是 HH:MM（00:00–23:59）");
+  return { hour: Number(match[1]), minute: Number(match[2]) };
 }
 
+export function mergeConfig(userCfg = {}) {
+  const merged = { ...DEFAULTS, ...userCfg };
+  parseMorningHour(merged.morning_hour);
+  return merged;
+}
+
+// The no-argument default is the Claude-side config. Codex call sites must pass
+// ~/sleep-well/codex/config.json explicitly.
 export function loadConfig(path = join(homedir(), "sleep-well", "config.json")) {
   let userCfg = {};
   try {

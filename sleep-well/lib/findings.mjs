@@ -14,5 +14,16 @@ export function appendFinding(path, finding) {
 
 export function readFindings(path) {
   if (!existsSync(path)) return [];
-  return readFileSync(path, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const findings = [];
+  for (const raw of readFileSync(path, "utf-8").split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      findings.push(JSON.parse(line));
+    } catch {
+      // JSONL is append-only and a killed writer may leave one partial line.
+      // Preserve the remaining valid findings instead of disabling discovery.
+    }
+  }
+  return findings;
 }

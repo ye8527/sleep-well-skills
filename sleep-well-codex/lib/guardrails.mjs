@@ -1,5 +1,6 @@
 // lib/guardrails.mjs
-// SAFETY-CRITICAL. Enforced in code, never left to model judgement.
+// SAFETY-CRITICAL decision helpers. Enforcement depends on the calling orchestrator;
+// see each variant's SKILL.md for the actual boundary.
 
 // KNOWN LIMITATION: this is a fail-closed allowlist + denylist over COMMAND STRINGS. It cannot
 // sandbox arbitrary code execution — `node -e`/`python -c`, and especially project scripts run by
@@ -14,8 +15,10 @@ const DENY_PATTERNS = [
   /\bdoas\b/,
   /\bgit\b.*\bpush\b/,                       // git push with any flags (incl. `git -C <dir> push`)
   /--force\b|--force-with-lease\b|\bforce-push\b/,
-  /\bgh\s+(pr|release)\s+create\b/,
-  /\bgh\s+(secret|variable|workflow)\s+\S+/,
+  // `gh` is a general remote mutation/exfiltration client (`api`, `gist`,
+  // `repo delete`, ...). Keep only the bounded read-only discovery forms that
+  // this skill actually needs; fail closed for every other subcommand.
+  /\bgh\s+(?!(?:issue\s+(?:list|view)|pr\s+(?:list|view|diff)|repo\s+view|run\s+(?:list|view)|workflow\s+(?:list|view))\b)/,
   /\bnpm\s+publish\b|\byarn\s+publish\b|\bpnpm\s+publish\b/,
   /\b(yarn|pnpm)\s+(deploy|publish|release)\b/,             // yarn/pnpm deploy|publish|release
   /\b(npm|yarn|pnpm)\b[^|;&]*\brun\b[^|;&]*\b(deploy|publish|release|prod)/i,  // run a deploy-ish script (flags before `run` OK)
@@ -40,7 +43,7 @@ const DENY_PATTERNS = [
   /\bwget\b.*(--post-file|--body-file)\b/,                                          // wget file upload exfiltration
   /\bscp\b/,
   /\brsync\b.*\s\S+@\S+:/,
-  /\bfind\b.*(-delete|-exec\s+rm)\b/,
+  /\bfind\b[^|;&\n]*\s-(delete|exec|execdir|ok|okdir)\b/,  // action predicates can execute arbitrary commands or mass-delete
   /\brm\b[^|;&\n]*\s(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\b/,  // recursive rm anywhere in argv: -rf/-Rf/-r, split `-f -r`, --recursive
   /\bgit\b.*\breset\s+--hard\b/,                        // discards uncommitted work the review loop depends on (incl. git -C <dir> reset --hard)
   /\bgit\b.*\bcheckout\b.*(\s--(\s|$)|\s\.(\s|$)|\s-f(\s|$)|\s--force\b)/,  // checkout that discards worktree: `-- <pathspec>`, `.`, `-f`, `--force` (incl. `git checkout HEAD -- file`)
@@ -50,6 +53,7 @@ const DENY_PATTERNS = [
   /\bgit\b.*\brestore\b.*(--worktree|\s-W\b)/,                            // `git restore --worktree` discards even with --staged
   /\bgit\b.*\brestore\b(?!\s+--staged)/,               // `git restore <path>` discards (allow `git restore --staged`)
   /\bgit\b.*\bclean\s+-[a-zA-Z]*[dfx]/,               // `git clean -fd` deletes untracked files
+  /\bgit\b.*\bstash\b/,                               // moves the uncheckpointed review diff out of the worktree
   /\bxargs\s+rm\b/,                                    // `find … | xargs rm` mass-delete
   /\bgit\b.*\bbranch\b.*(\s-[a-zA-Z]*[dD]|--delete\b)/,  // git branch -d/-D/-df/--delete removes checkpoint branches
   /\bgit\b.*\bpull\b/,  // pull merges/rebases fetched commits — violates never-merge + changes base
@@ -59,7 +63,7 @@ const DENY_PATTERNS = [
   /\bperl\b[^|;&]*\s-i\b/,  // perl -i in-place edit
 ];
 
-// 边界规则改了三版，每版都被打出反例——所以现在**按关键词分别列后缀**，并双向断言。
+// 边界规则改了多版，每版都被打出反例——所以现在**按关键词分别列后缀**，并双向断言。
 //   v1 裸子串        → `sta<nda>rd/` `il<legal>/` 误报，那个仓库每次改动中止整夜（R18）
 //   v2 两端要分隔符  → `NDA2026.pdf` `contractual-obligations.pdf` 漏报（R19 #1）
 //   v3 统一词尾白名单 → `NDAv2.pdf` `contractDraft.docx` 仍漏，而 `legality/` 误报（R20 #2 #3）
@@ -89,10 +93,20 @@ const PROTECTED_PATH = new RegExp(
   "i",
 );
 
+// 复合词补充规则。通用的「同类字符边界」必须保留，否则 standard/组合同步器
+// 会重新误报；但常见法务文书会把关键词包在复合词里。只补高置信长词，避免裸子串。
+const CJK_LEGAL_COMPOUND =
+  /(合同書|合同书|契約書|協議書|协议书|労働契約|劳动合同|勞動合同|秘密保持契約|秘密保持协议)/;
+// 英文补大小写敏感的 CamelCase 边界：EmploymentContract、MasterAgreement、
+// ClientNDA2026。小写 standard/contractor 不会命中；已有不区分大小写规则继续
+// 处理以边界开头的 contractDraft、NDAv2 等名称。
+const CAMEL_LEGAL_COMPOUND =
+  /(?:^|[a-z])(?:NDA|Contract|Agreement)(?=(?:s|es|v?\d+|Final|Draft|Signed|Executed)?(?:[^A-Za-z]|$))/;
+
 // 凭据类（Codex R3 #3）: 夜班无人值守，凭据被改或被读的后果比合同更直接。
 // 与 PROTECTED_PATH 分开定义再合并，避免把两类语义混在一条难读的正则里。
 const CREDENTIAL_PATH =
-  /(^|\/)\.env(\.|$)|(^|\/)\.netrc$|(^|\/)\.npmrc$|(^|\/)\.pypirc$|(^|\/)id_(rsa|dsa|ecdsa|ed25519)$|\.pem$|\.p12$|\.pfx$|\.keystore$|(^|\/)credentials(\.json|\.ya?ml)?$|(^|\/)secrets?\.(json|ya?ml|toml|env)$|(^|\/)\.aws\/|(^|\/)\.ssh\/|(^|\/)\.gnupg\/|(^|\/)service[-_]?account[^\/]*\.json$|(^|\/)\.htpasswd$|(^|\/)\.pgpass$|(^|\/)kubeconfig$|(^|\/)\.kube\/|\.jks$|\.key$|(^|\/)\.envrc$|(^|\/)\.git-credentials$/i;
+  /(^|\/)[^\/]*\.env(\.|$)|(^|\/)\.netrc$|(^|\/)\.npmrc$|(^|\/)\.pypirc$|(^|\/)id_(rsa|dsa|ecdsa|ed25519)$|\.pem$|\.p12$|\.pfx$|\.keystore$|(^|\/)credentials(\.json|\.ya?ml)?$|(^|\/)secrets?\.(json|ya?ml|toml|env)$|(^|\/)\.aws\/|(^|\/)\.ssh\/|(^|\/)\.gnupg\/|(^|\/)service[-_]?account[^\/]*\.json$|(^|\/)\.htpasswd$|(^|\/)\.pgpass$|(^|\/)kubeconfig$|(^|\/)\.kube\/|\.jks$|\.key$|(^|\/)\.envrc$|(^|\/)\.git-credentials$/i;
 
 export const ALLOWED_TASK_TYPES = new Set([
   "review-fix", "test", "docs", "lint", "small-todo", "feature", "bugfix", "refactor",
@@ -149,8 +163,9 @@ export function classifyCommand(cmd) {
   for (const re of DENY_PATTERNS) {
     if (re.test(cmd)) return { allowed: false, reason: `denied by guardrail ${re}` };
   }
-  // 2) deny command substitution — shell evaluates $(...) / backtick before we see the result
-  if (/\$\(|`/.test(cmd)) return { allowed: false, reason: "command substitution — needs human" };
+  // 2) deny command/process substitution — the shell evaluates their nested
+  // commands before the allowlisted outer command sees the result.
+  if (/\$\(|`|[<>]\(/.test(cmd)) return { allowed: false, reason: "command/process substitution — needs human" };
   // 2b) deny shell output redirection to files (allows 2>&1, >&2, >/dev/null)
   //     Strip fd-dup redirects (2>&1, >&2) and /dev/null redirects first so the
   //     segment splitter (which splits on bare `&`) does not misparse them.
@@ -183,6 +198,17 @@ export function classifyCommand(cmd) {
 const CREDENTIAL_EXEMPT = /(\.example$|\.sample$|\.template$|\.dist$|(^|\/)\.env\.example$|(^|\/)\.env\.sample$|(^|\/)\.env\.template$)/i;
 
 export function isProtectedPath(p) {
-  if (CREDENTIAL_EXEMPT.test(p)) return PROTECTED_PATH.test(p);
-  return PROTECTED_PATH.test(p) || CREDENTIAL_PATH.test(p);
+  const legal = PROTECTED_PATH.test(p) || CJK_LEGAL_COMPOUND.test(p) || CAMEL_LEGAL_COMPOUND.test(p);
+  if (CREDENTIAL_EXEMPT.test(p)) return legal;
+  return legal || CREDENTIAL_PATH.test(p);
+}
+
+// Deterministic gate for the model-driven variant's pre-task status probe.
+// Probe failure is never equivalent to a clean repository.
+export function baselineGate(porcelainText, probeOk = true) {
+  if (probeOk !== true) return { clean: false, reason: "git status probe failed" };
+  if (String(porcelainText ?? "").trim() !== "") {
+    return { clean: false, reason: "repository has pre-existing changes" };
+  }
+  return { clean: true, reason: "clean" };
 }

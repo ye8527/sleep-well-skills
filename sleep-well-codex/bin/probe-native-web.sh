@@ -16,13 +16,21 @@
 # 判据是**工具调用事件是否出现**，不是模型自陈「我做不到」（R9 #12）——
 # 模型可能因瞬时错误或拒答而说 BLOCKED，那不等于能力被裁掉。
 #
-# 用法: bin/probe-native-web.sh
+# 用法: bin/probe-native-web.sh（遵循 CODEX_HOME；默认 ~/.codex）
 # 退出码: 0 = 已阻断（正对照成立）; 1 = 未阻断; 2 = 探针不成立（含正对照失败）
 #
 # ⚠️ 会消耗两次真实模型调用。Codex CLI 升级后跑一次。
 set -uo pipefail
 
 CODEX_BIN="${SLEEP_WELL_CODEX:-codex}"
+SW_USER_CODEX_HOME="$(cd "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null && pwd -P)" || {
+  echo "探针不成立: 无法解析 CODEX_HOME" >&2
+  exit 2
+}
+[ -r "$SW_USER_CODEX_HOME/auth.json" ] || {
+  echo "探针不成立: 缺少 Codex 登录态（CODEX_HOME/auth.json 不可读）" >&2
+  exit 2
+}
 MARKER="Example Domain"          # example.com 的真实 <h1>
 URL="https://example.com"
 PROMPT="请打开 ${URL} 并把页面 <h1> 的原文告诉我。不要用 shell（curl/wget 会被沙箱拒绝），用你的原生网页能力。若确实无法访问网络，只回答 BLOCKED。"
@@ -35,7 +43,8 @@ git -C "$repo" init -q . 2>/dev/null || { echo "探针失败: git init" >&2; exi
 
 # $1=home 目录名 $2=yes|no 表示 web_search 是否放在顶层
 mkhome() {
-  local h="$tmp/$1"; mkdir -p "$h"
+  local h="$tmp/$1"
+  mkdir -p "$h" || { echo "探针不成立: 无法创建探针 home" >&2; return 1; }
   {
     echo 'sandbox_mode = "workspace-write"'
     [ "$2" = yes ] && echo 'web_search = "disabled"'
@@ -44,8 +53,12 @@ mkhome() {
     echo 'network_access = false'
     # 正对照刻意把键放在表头之后，复现 R7 的错误位置
     [ "$2" = no ] && echo 'web_search = "disabled"'
-  } > "$h/config.toml"
-  [ -f "$HOME/.codex/auth.json" ] && ln -sfn "$HOME/.codex/auth.json" "$h/auth.json"
+    : # keep the group successful when the final optional line is absent
+  } > "$h/config.toml" || { echo "探针不成立: 无法写入探针配置" >&2; return 1; }
+  ln -sfn "$SW_USER_CODEX_HOME/auth.json" "$h/auth.json" \
+    || { echo "探针不成立: 无法链接 Codex 登录态" >&2; return 1; }
+  [ -r "$h/auth.json" ] \
+    || { echo "探针不成立: 探针 home 的登录态链接不可读" >&2; return 1; }
   printf '%s\n' "$h"
 }
 
@@ -56,8 +69,10 @@ run_one() {   # $1=home $2=输出文件
     </dev/null >"$2" 2>&1
 }
 
-CTRL="$(mkhome ctrl no)"    # 正对照: 键放错位置 → 应能打开 URL
-SUBJ="$(mkhome subj yes)"   # 受测: 键在顶层     → 应打不开
+CTRL="$(mkhome ctrl no)" \
+  || { echo "探针不成立: 正对照环境准备失败" >&2; exit 2; }
+SUBJ="$(mkhome subj yes)" \
+  || { echo "探针不成立: 受测环境准备失败" >&2; exit 2; }
 
 ( cd "$repo" && run_one "$CTRL" "$tmp/ctrl.out" ); crc=$?
 ( cd "$repo" && run_one "$SUBJ" "$tmp/subj.out" ); src=$?

@@ -10,6 +10,18 @@ test("classifyOutcome: 各类信号", () => {
   assert.equal(classifyOutcome("something weird", 1, "codex").kind, "other");
 });
 
+test("本地超时与普通任务正文绝不升级为认证失效", () => {
+  assert.equal(
+    classifyOutcome("正在修复 OAuth 401 unauthorized credential 重试", 124, "codex").kind,
+    "transient",
+  );
+  assert.equal(
+    classifyOutcome("实现 authenticate() 时测试失败: credential fixture missing", 1, "codex").kind,
+    "other",
+  );
+  assert.equal(classifyOutcome("Error: 401 Unauthorized", 1, "codex").kind, "auth");
+});
+
 test("claude-handoff 自报的 kind 优先采信", () => {
   assert.equal(classifyOutcome("CLAUDE_UNAVAILABLE (quota)", 2, "claude").kind, "quota");
   assert.equal(classifyOutcome("CLAUDE_UNAVAILABLE (auth)", 2, "claude").kind, "auth");
@@ -25,6 +37,7 @@ test("退出码 0 + 正文含额度字样 → 判 ok（Codex R1 #17: 不得从�
 
 test("唯一例外: claude-handoff 自报的结构化信号，即便退出码 0 也采信", () => {
   assert.equal(classifyOutcome("CLAUDE_UNAVAILABLE (quota)", 0, "claude").kind, "quota");
+  assert.equal(classifyOutcome("CLAUDE_UNAVAILABLE (quota)", 0, "codex").kind, "ok");
 });
 
 test("decideHop: 五种动作", () => {

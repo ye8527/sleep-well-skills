@@ -31,8 +31,9 @@ for need in 'guard_install() {' 'guard_uninstall() {' 'recover_pending_hook() {'
 done
 
 # jq_get 与 log/push 由 orchestrator 提供，这里给等价桩
-mkfn() {   # $1=CODEX_HOME
+mkfn() {   # $1=isolated runtime home
   { printf 'CODEX_HOME=%q\n' "$1"
+    printf 'SW_RUNTIME_HOME=%q\n' "$1"
     cat <<'STUB'
 log(){ printf '[log] %s\n' "$*" >>"$CODEX_HOME/log.txt"; }
 push(){ printf '[push] %s | %s\n' "$1" "$2" >>"$CODEX_HOME/log.txt"; }

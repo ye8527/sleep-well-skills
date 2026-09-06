@@ -6,6 +6,10 @@ import { expandHome } from "./config.mjs";
 const META_KEYS = new Set(["id", "repo", "priority", "type", "files", "team"]);
 
 export function parseQueue(md) {
+  if (typeof md !== "string") throw new TypeError("parseQueue expects Markdown text");
+  if (!md.includes("\n") && /^(?:~|\/)/.test(md.trim())) {
+    throw new Error("parseQueue expects file contents, not a queue file path");
+  }
   const blocks = [];
   let cur = null;
   for (const line of md.split("\n")) {
@@ -35,6 +39,12 @@ export function parseQueue(md) {
   }
 
   const tasks = blocks.map((b) => {
+    // Titles are written verbatim to local logs and the Markdown morning
+    // report. C0/C1 controls (notably U+009B CSI) could rewrite terminal
+    // diagnostics, so reject them at the queue trust boundary just like ids.
+    if (/\p{Cc}/u.test(b.title)) {
+      throw new Error(`任务标题含控制字符，收到: ${JSON.stringify(b.title)}`);
+    }
     if (!b.fields.id) throw new Error(`queue task "${b.title}" is missing id`);
     // id 会被拼进文件路径（编排器用 `$LOG_DIR/${id}-*.out` 与 `$LOG_DIR/${id}.md`），
     // `../` 之类会写到 logs 目录之外。
@@ -67,8 +77,8 @@ export function parseQueue(md) {
     }
     // priority 写错会变成 NaN，而 NaN 参与比较全为 false → 排序结果不可预测且无提示
     // （R15 自查 Q-2）。宁可报错，也不要静默乱序。
-    if (b.fields.repo !== undefined && b.fields.repo.trim() === "") {
-      throw new Error(`任务 ${b.fields.id} 的 repo 为空`);
+    if (!b.fields.repo || b.fields.repo.trim() === "") {
+      throw new Error(`任务 ${b.fields.id} 缺少 repo 或 repo 为空`);
     }
     if (b.fields.priority !== undefined && !/^-?\d+$/.test(b.fields.priority.trim())) {
       throw new Error(`任务 ${b.fields.id} 的 priority 不是整数: ${JSON.stringify(b.fields.priority)}`);
@@ -79,7 +89,7 @@ export function parseQueue(md) {
     return {
       id: b.fields.id,
       title: b.title,
-      repo: expandHome(b.fields.repo || ""),
+      repo: expandHome(b.fields.repo),
       priority: b.fields.priority ? Number(b.fields.priority) : 100,
       type: b.fields.type || "task",
       files: b.fields.files ? Number(b.fields.files) : undefined,
